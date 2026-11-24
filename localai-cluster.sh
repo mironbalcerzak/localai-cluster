@@ -130,8 +130,7 @@ case "${1:-}" in
         [[ -f "$ENV_FILE" ]] || create_env
         export LOCALAI_LOCAL_NODE_NAME="$(hostname)"
         echo "LocalAI host: http://127.0.0.1:$(env_get LOCALAI_PORT)  (LAN: http://$(env_get LOCALAI_SERVER):$(env_get LOCALAI_PORT))"
-        echo "Login: $(env_get LOCALAI_ADMIN_EMAIL) / $(env_get LOCALAI_ADMIN_PASSWORD)"
-        echo "API key: $(env_get LOCALAI_API_KEY)   Ctrl+C stops it."
+        echo "No login or API key needed: the host adds the key to every request. Ctrl+C stops it."
         create_admin >/dev/null 2>&1 &
         exec docker compose -p localai --env-file "$ENV_FILE" -f "${ROOT}/docker/host/docker-compose.yml" up
         ;;

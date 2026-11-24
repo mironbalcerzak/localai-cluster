@@ -37,8 +37,7 @@ call :create_env || exit /b 1
 call :load_env
 set "LOCALAI_LOCAL_NODE_NAME=%COMPUTERNAME%"
 echo LocalAI host: http://127.0.0.1:%LOCALAI_PORT%  - LAN: http://%LOCALAI_SERVER%:%LOCALAI_PORT%
-echo Login: %LOCALAI_ADMIN_EMAIL% / %LOCALAI_ADMIN_PASSWORD%
-echo API key: %LOCALAI_API_KEY%   Ctrl+C stops it.
+echo No login or API key needed: the host adds the key to every request. Ctrl+C stops it.
 if defined LOCALAI_ADMIN_PASSWORD call :create_admin
 docker compose -p localai --env-file "%ENV_FILE%" -f "%ROOT%docker\host\docker-compose.yml" up
 exit /b %ERRORLEVEL%

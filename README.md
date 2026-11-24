@@ -49,10 +49,16 @@ Give every PC a fixed IP (DHCP reservation in the router).
 
 The first run creates `.env` next to the script: the host's IP, a join token,
 the API key, the model (`LOCALAI_MODEL`, gemma-4-12b by default) and the
-database password and the web UI login. Once the web UI answers, the host
-creates that login as admin: `admin@localai` / `admin123456` by default
-(`LOCALAI_ADMIN_EMAIL` / `LOCALAI_ADMIN_PASSWORD`; the script prints it). Other
-sign-ups wait for approval. API clients send `Authorization: Bearer <LOCALAI_API_KEY>`.
+database password.
+
+**No login and no API key.** LocalAI's distributed mode needs authentication, so
+it stays on inside, but a small proxy on the host's port (Caddy, in
+`docker/host/docker-compose.yml`) adds `LOCALAI_API_KEY` to every request. Clients
+can send no key or any dummy key, and the web UI opens as an admin ("API Key User")
+without a login. Only the workers' own calls (`/api/node/*`) pass through unchanged,
+with their join token. The add-on pages do not work under that user. The host still
+creates an admin account (`LOCALAI_ADMIN_EMAIL` / `LOCALAI_ADMIN_PASSWORD`) on its
+first start.
 
 The model named in `LOCALAI_MODEL` must be installed on the host; the host then
 loads it on every PC. The default is `unsloth/gemma-4-12B-it-qat-GGUF` from Hugging
@@ -108,7 +114,8 @@ limit. The Linux script needs `jq` or `python3`.
 
 ## Security notes
 
+- Anyone who can reach the host's port is admin of LocalAI: they can use the API,
+  install and delete models and change settings. Keep it on a home network.
 - `.env` holds the join token, API key, admin login and database password: share it only with your own PCs.
-- `admin123456` is a weak default: change it in the web UI, or in `.env` before the first start.
 - The message bus (NATS, port 4222) has no password: anyone on the network could
   send it commands. Fine on a home network, not on a shared one.

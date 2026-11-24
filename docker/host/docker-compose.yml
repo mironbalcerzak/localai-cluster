@@ -1,6 +1,8 @@
 # LocalAI host: the server of the cluster. Started by ../../localai-cluster.sh host (or .bat).
 #
-#   frontend      API + web UI on :${LOCALAI_PORT}. Routes every request to a worker.
+#   proxy         :${LOCALAI_PORT} on the network. Adds the API key to every request, so
+#                 clients and the web UI need no key or login (home network only).
+#   frontend      API + web UI. Routes every request to a worker.
 #   worker-local  the GPU of this PC, registered as a worker like any other.
 #   postgres      users, API keys, node registry (required by distributed mode).
 #   nats          message bus; remote workers connect to :4222.
@@ -9,6 +11,17 @@
 # Settings and secrets live in the .env next to the start scripts (created by the host).
 
 name: ${COMPOSE_PROJECT_NAME:-localai}
+
+configs:
+  caddyfile:
+    content: |
+      :8080 {
+        # Workers register and send heartbeats with their own token: leave those alone.
+        @clients not path /api/node/*
+        # Overwrite, not add: many OpenAI clients send a dummy key such as "sk-xxx".
+        request_header @clients Authorization "Bearer {$$LOCALAI_API_KEY}"
+        reverse_proxy frontend:8080
+      }
 
 x-common-env: &common-env
   LOCALAI_NATS_URL: "nats://nats:4222"
@@ -38,11 +51,25 @@ services:
     ports:
       - "${LOCALAI_BIND:-0.0.0.0}:4222:4222"
 
+  # Distributed mode refuses to run without auth, so auth stays on in the frontend and
+  # this proxy signs every request with the API key instead.
+  proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      LOCALAI_API_KEY: "${LOCALAI_API_KEY:?start with localai-cluster.sh host / localai-cluster.bat host, which creates .env}"
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+    ports:
+      - "${LOCALAI_BIND:-0.0.0.0}:${LOCALAI_PORT:-23422}:8080"
+    depends_on:
+      frontend:
+        condition: service_started
+
   frontend:
     image: localai/localai:latest-gpu-nvidia-cuda-12
     restart: unless-stopped
-    ports:
-      - "${LOCALAI_BIND:-0.0.0.0}:${LOCALAI_PORT:-23422}:8080"
     environment:
       <<: *common-env
       LOCALAI_DISTRIBUTED: "true"
@@ -55,7 +82,7 @@ services:
       # Model staging to a fresh worker over Wi-Fi can be slow: let requests wait for it.
       LOCALAI_MODEL_LOAD_WAIT: "${LOCALAI_MODEL_LOAD_WAIT:-10m}"
       LOCALAI_NATS_MODEL_LOAD_TIMEOUT: "${LOCALAI_NATS_MODEL_LOAD_TIMEOUT:-}"
-      LOCALAI_API_KEY: "${LOCALAI_API_KEY:-}"
+      LOCALAI_API_KEY: "${LOCALAI_API_KEY:?}"
       LOCALAI_ADMIN_EMAIL: "${LOCALAI_ADMIN_EMAIL:-}"
       # The first account becomes admin; later sign-ups wait for admin approval.
       LOCALAI_REGISTRATION_MODE: "${LOCALAI_REGISTRATION_MODE:-approval}"

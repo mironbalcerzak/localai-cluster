@@ -118,8 +118,8 @@ The host's own GPU worker has the same service (`worker-sync`).
 On Windows (Docker Desktop with WSL 2) the NVIDIA driver's CUDA library sits in
 `/usr/lib/wsl/lib` inside the container, where LocalAI's llama.cpp backend does not look
 by itself: the model would load on the CPU while `nvidia-smi` shows the GPU just fine. The
-worker adds that folder to its library path at start; its log says
-`Windows GPU driver found in /usr/lib/wsl/lib`. `diagnose` shows whether a loaded model
+worker adds the folder that holds `libcuda.so.1` to its library path at start; its log
+says `NVIDIA driver library: /usr/lib/wsl/lib/libcuda.so.1 (added to LD_LIBRARY_PATH)`. `diagnose` shows whether a loaded model
 really sits on the GPU.
 
 ## Diagnose

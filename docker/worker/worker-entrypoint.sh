@@ -16,16 +16,25 @@ export LOCALAI_ADVERTISE_ADDR="${WORKER_IP}:50051"
 export LOCALAI_ADVERTISE_HTTP_ADDR="${WORKER_IP}:50050"
 export LOCALAI_NODE_NAME="${WORKER_NAME:-worker-${WORKER_IP//./-}}"
 
-# Windows (Docker Desktop, WSL 2) puts the NVIDIA driver library libcuda.so.1 in
-# /usr/lib/wsl/lib, not in /usr/lib/x86_64-linux-gnu as on Linux. LocalAI's llama.cpp
-# backend starts with its own loader (lib/ld.so) and only looks in its own folder plus
-# LD_LIBRARY_PATH, so without this it finds no CUDA and silently runs on the CPU.
-if [[ -e /usr/lib/wsl/lib/libcuda.so.1 ]]; then
-    export LD_LIBRARY_PATH="/usr/lib/wsl/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-    echo "localai-worker: Windows GPU driver found in /usr/lib/wsl/lib"
-elif [[ -d /usr/lib/wsl ]]; then
-    echo "localai-worker: WARNING: WSL 2 but no libcuda.so.1 in /usr/lib/wsl/lib: models will run on the CPU (update the NVIDIA driver and Docker Desktop)" >&2
-fi
+# LocalAI's llama.cpp backend starts with its own loader (lib/ld.so), which looks only in
+# its own folder, LD_LIBRARY_PATH and the standard folders, not in the system's library
+# cache. Windows (Docker Desktop, WSL 2) puts the NVIDIA driver library libcuda.so.1 in
+# /usr/lib/wsl/lib, listed only in that cache: the backend then finds no CUDA and silently
+# runs on the CPU, while nvidia-smi (mounted at /usr/bin) shows the GPU just fine. So
+# put the folder that holds libcuda.so.1 on LD_LIBRARY_PATH, wherever it is.
+cuda_dir=""
+for d in /usr/lib/wsl/lib $(ldconfig -p 2>/dev/null | awk '$1 == "libcuda.so.1" {print $NF}' | xargs -r -n1 dirname); do
+    if [[ -e "$d/libcuda.so.1" ]]; then cuda_dir="$d"; break; fi
+done
+case "$cuda_dir" in
+    "")
+        echo "localai-worker: WARNING: no NVIDIA driver library (libcuda.so.1) in this container: models will run on the CPU. Linux: install the NVIDIA Container Toolkit; Windows: update the NVIDIA driver and Docker Desktop" >&2;;
+    /usr/lib/x86_64-linux-gnu|/lib/x86_64-linux-gnu)
+        echo "localai-worker: NVIDIA driver library: ${cuda_dir}/libcuda.so.1";;
+    *)
+        export LD_LIBRARY_PATH="${cuda_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+        echo "localai-worker: NVIDIA driver library: ${cuda_dir}/libcuda.so.1 (added to LD_LIBRARY_PATH)";;
+esac
 
 echo "localai-worker: node ${LOCALAI_NODE_NAME} (${WORKER_IP}) -> server ${LOCALAI_REGISTER_TO}"
 exec /entrypoint.sh worker "$@"

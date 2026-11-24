@@ -51,7 +51,7 @@ services:
       # Workers must know the registration token, so approving them by hand adds nothing here.
       LOCALAI_AUTO_APPROVE_NODES: "true"
       # One copy of LOCALAI_MODEL on every node, loaded as soon as the node joins.
-      LOCALAI_MODEL_SCHEDULING: '[{"model_name":"${LOCALAI_MODEL:-gemma-4-12b-it-Q4_K_M}","replicas":"all"}]'
+      LOCALAI_MODEL_SCHEDULING: '[{"model_name":"${LOCALAI_MODEL:-gemma-4-12B-it-qat-UD-Q4_K_XL}","replicas":"all"}]'
       # Model staging to a fresh worker over Wi-Fi can be slow: let requests wait for it.
       LOCALAI_MODEL_LOAD_WAIT: "${LOCALAI_MODEL_LOAD_WAIT:-10m}"
       LOCALAI_NATS_MODEL_LOAD_TIMEOUT: "${LOCALAI_NATS_MODEL_LOAD_TIMEOUT:-}"

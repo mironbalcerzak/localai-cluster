@@ -12,6 +12,7 @@ localai-cluster.sh / .bat   host | worker
 .env.example               the format of .env
 docker/host/               host compose stack (API, Postgres, NATS, local GPU worker)
 docker/worker/             worker image and compose file
+localai-mcp/               MCP server: available models, capacity, chat completions
 ```
 
 Both scripts run in the foreground and show the logs; Ctrl+C stops everything.
@@ -55,10 +56,10 @@ creates that login as admin: `admin@localai` / `admin123456` by default
 sign-ups wait for approval. API clients send `Authorization: Bearer <LOCALAI_API_KEY>`.
 
 The model named in `LOCALAI_MODEL` must be installed on the host; the host then
-loads it on every PC. The default is `unsloth/gemma-4-12b-it-GGUF` from Hugging Face:
-in the web UI, Models, search for it and install the Q4_K_M variant, which LocalAI
-names `gemma-4-12b-it-Q4_K_M`. For another model or variant, put the name shown in
-the web UI into `LOCALAI_MODEL` (on the host and the workers) and restart.
+loads it on every PC. The default is `unsloth/gemma-4-12B-it-qat-GGUF` from Hugging
+Face: in the web UI, Models, search for it and install the UD-Q4_K_XL variant, which
+LocalAI names `gemma-4-12B-it-qat-UD-Q4_K_XL`. For another model or variant, put the
+name shown in the web UI into `LOCALAI_MODEL` (on the host and the workers) and restart.
 
 ## Worker
 

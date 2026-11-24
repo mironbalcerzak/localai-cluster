@@ -52,21 +52,25 @@ the API key, the model (`LOCALAI_MODEL`, gemma-4-12b by default) and the
 database password.
 
 **No login and no API key.** LocalAI's distributed mode needs authentication, so
-it stays on inside, but a proxy on the host's port (nginx, in
-`docker/host/docker-compose.yml`) handles keys: a client's own key is checked first
-and passed on when LocalAI accepts it; no key, or a key LocalAI rejects (401), is
-replaced by `LOCALAI_API_KEY`. So tools that insist on sending a key work, and so
-do clients and the web UI without one (the UI opens as the admin "API Key User";
-the add-on pages do not work under that user). The workers' own calls
-(`/api/node/*`) pass through unchanged, with their join token. The host still
-creates an admin account (`LOCALAI_ADMIN_EMAIL` / `LOCALAI_ADMIN_PASSWORD`) on its
-first start.
+it stays on inside. A small Node proxy on the host's port (`docker/host/proxy/server.mjs`)
+handles keys: a client's own key is checked once and passed on when LocalAI accepts
+it; no key, or a key LocalAI rejects (401), is replaced by `LOCALAI_API_KEY`. So tools
+that insist on sending a key work, and so do clients and the web UI without one (the
+UI opens as the admin "API Key User"; the add-on pages do not work under that user).
+The workers' own calls (`/api/node/*`) pass through unchanged, with their join token.
+The host still creates an admin account (`LOCALAI_ADMIN_EMAIL` /
+`LOCALAI_ADMIN_PASSWORD`) on its first start.
 
-**Models load on demand.** No model is loaded while the cluster is idle. The first
-request for a model loads one copy (about a minute); more PCs get a copy only while
-all copies are busy. A model with no requests for `LOCALAI_IDLE_UNLOAD` (2 minutes by
-default) is unloaded everywhere by the host's `idle-unloader` container (LocalAI's
-own idle watchdog does not reach models on workers).
+**Models load on demand, and only `LOCALAI_MAX_LOADED_MODELS` at a time.** No model
+is loaded while the cluster is idle. The first request for a model loads one copy;
+more PCs get a copy only while all copies are busy. The proxy reads the model of every
+inference request and keeps at most `LOCALAI_MAX_LOADED_MODELS` different models (1 by
+default) loaded in the cluster: a request for another model first unloads the least
+recently used idle one. If all loaded models are busy, the request waits until one is
+idle (up to `LOCALAI_EVICT_WAIT`, 10 minutes, then HTTP 503), so with the default of 1
+chat and embedding requests take turns, and each switch reloads a model. A model with
+no requests for `LOCALAI_IDLE_UNLOAD` (2 minutes) is unloaded. The proxy logs every
+unload: `docker logs localai-proxy-1`.
 
 The model named in `LOCALAI_MODEL` must be installed on the host; the host then
 loads it on every PC. The default is `unsloth/gemma-4-12B-it-qat-GGUF` from Hugging

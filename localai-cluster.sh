@@ -77,6 +77,9 @@ LOCALAI_MODEL=gemma-4-12B-it-qat-UD-Q4_K_XL
 LOCALAI_EMBEDDING_MODEL=Qwen3-Embedding-8B-Q4_K_M.gguf
 # Models load on the first request and unload after this long without one.
 LOCALAI_IDLE_UNLOAD=2m
+# How many different models may be loaded at once in the cluster. Loading another
+# one first unloads the least recently used idle model.
+LOCALAI_MAX_LOADED_MODELS=1
 LLAMACPP_PARALLEL=5
 
 # Used by the host only.

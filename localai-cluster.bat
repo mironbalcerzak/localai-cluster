@@ -156,6 +156,9 @@ call :secret PGPASS
     echo LOCALAI_EMBEDDING_MODEL=Qwen3-Embedding-8B-Q4_K_M.gguf
     echo # Models load on the first request and unload after this long without one.
     echo LOCALAI_IDLE_UNLOAD=2m
+    echo # How many different models may be loaded at once in the cluster. Loading another
+    echo # one first unloads the least recently used idle model.
+    echo LOCALAI_MAX_LOADED_MODELS=1
     echo LLAMACPP_PARALLEL=5
     echo.
     echo # Used by the host only.

@@ -1,8 +1,8 @@
 # LocalAI host: the server of the cluster. Started by ../../localai-cluster.sh host (or .bat).
 #
-#   proxy         :${LOCALAI_PORT} on the network (nginx). Passes a client's valid API key
-#                 on and fills in the default key otherwise, so no key or login is needed.
-#   idle-unloader unloads models after LOCALAI_IDLE_UNLOAD without requests.
+#   proxy         :${LOCALAI_PORT} on the network (Node, proxy/server.mjs). Fills in the
+#                 API key, keeps at most LOCALAI_MAX_LOADED_MODELS models loaded and
+#                 unloads models after LOCALAI_IDLE_UNLOAD without requests.
 #   frontend      API + web UI. Routes every request to a worker.
 #   worker-local  the GPU of this PC, registered as a worker like any other.
 #   postgres      users, API keys, node registry (required by distributed mode).
@@ -12,86 +12,6 @@
 # Settings and secrets live in the .env next to the start scripts (created by the host).
 
 name: ${COMPOSE_PROJECT_NAME:-localai}
-
-configs:
-  # nginx expands ${LOCALAI_API_KEY} from its environment when it starts; $$name are nginx variables.
-  nginx-template:
-    content: |
-      map $$http_upgrade $$connection_upgrade { default upgrade; '' ''; }
-
-      server {
-        listen 8080;
-        client_max_body_size 0;
-        proxy_http_version 1.1;
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-
-        # Workers register and send heartbeats with their own token: pass them as they are.
-        location /api/node/ {
-          proxy_set_header Host $$host;
-          proxy_pass http://frontend:8080;
-        }
-
-        # Everything else: first check the client's own key (a cheap GET /v1/models). A valid
-        # key is passed on; no key or a rejected one (401) is replaced by the default key.
-        location / {
-          auth_request /_localai_key_check;
-          error_page 401 = @default_key;
-          proxy_set_header Host $$host;
-          proxy_set_header Upgrade $$http_upgrade;
-          proxy_set_header Connection $$connection_upgrade;
-          proxy_pass http://frontend:8080;
-        }
-
-        location = /_localai_key_check {
-          internal;
-          if ($$http_authorization = "") { return 401; }
-          proxy_pass_request_body off;
-          proxy_set_header Content-Length "";
-          proxy_set_header Authorization $$http_authorization;
-          proxy_pass http://frontend:8080/v1/models;
-        }
-
-        location @default_key {
-          proxy_set_header Host $$host;
-          proxy_set_header Upgrade $$http_upgrade;
-          proxy_set_header Connection $$connection_upgrade;
-          proxy_set_header Authorization "Bearer ${LOCALAI_API_KEY}";
-          proxy_pass http://frontend:8080;
-        }
-      }
-
-  # LocalAI's own idle watchdog does not reach models loaded on workers, so this loop
-  # unloads a model once none of its copies has had a request for LOCALAI_IDLE_UNLOAD.
-  idle-unloader:
-    content: |
-      #!/bin/sh
-      apk add --no-cache curl jq >/dev/null || exit 1
-      case "$$IDLE" in
-        *h) idle=$$(( $${IDLE%h} * 3600 ));;
-        *m) idle=$$(( $${IDLE%m} * 60 ));;
-        *s) idle=$${IDLE%s};;
-        *)  idle=$$IDLE;;
-      esac
-      api="http://frontend:8080"
-      auth="Authorization: Bearer $$LOCALAI_API_KEY"
-      echo "idle-unloader: unloading models after $${idle}s without requests"
-      while true; do
-        curl -sf -m 10 -H "$$auth" "$$api/api/nodes/models" | jq -r --argjson now "$$(date +%s)" --argjson idle "$$idle" '
-          group_by(.model_name)[]
-          | select(all(.state == "loaded"))
-          | select((map(.in_flight // 0) | add) == 0)
-          | select($$now - (map((.last_used // .updated_at) | sub("\\.[0-9]+"; "") | fromdateiso8601) | max) > $$idle)
-          | .[0].model_name' 2>/dev/null |
-        while read -r model; do
-          curl -sf -m 60 -H "$$auth" -H 'Content-Type: application/json' \
-            -d "$$(jq -cn --arg m "$$model" '{model: $$m}')" "$$api/backend/shutdown" >/dev/null \
-            && echo "idle-unloader: unloaded $$model"
-        done
-        sleep 15
-      done
 
 x-common-env: &common-env
   LOCALAI_NATS_URL: "nats://nats:4222"
@@ -121,32 +41,22 @@ services:
     ports:
       - "${LOCALAI_BIND:-0.0.0.0}:4222:4222"
 
-  # Distributed mode refuses to run without auth, so auth stays on in the frontend and
-  # this proxy fills in the API key when a client sends none or a rejected one.
+  # Distributed mode refuses to run without auth, so auth stays on in the frontend and this
+  # proxy fills in the API key. It also unloads models: see proxy/server.mjs.
   proxy:
-    image: nginx:alpine
+    image: node:24-alpine
     restart: unless-stopped
+    init: true
+    command: ["node", "/app/server.mjs"]
     environment:
       LOCALAI_API_KEY: "${LOCALAI_API_KEY:?start with localai-cluster.sh host / localai-cluster.bat host, which creates .env}"
-    configs:
-      - source: nginx-template
-        target: /etc/nginx/templates/default.conf.template
+      LOCALAI_MAX_LOADED_MODELS: "${LOCALAI_MAX_LOADED_MODELS:-1}"
+      LOCALAI_IDLE_UNLOAD: "${LOCALAI_IDLE_UNLOAD:-2m}"
+      LOCALAI_EVICT_WAIT: "${LOCALAI_EVICT_WAIT:-10m}"
+    volumes:
+      - ./proxy:/app:ro
     ports:
       - "${LOCALAI_BIND:-0.0.0.0}:${LOCALAI_PORT:-23422}:8080"
-    depends_on:
-      frontend:
-        condition: service_started
-
-  idle-unloader:
-    image: alpine:3
-    restart: unless-stopped
-    command: ["sh", "/idle-unloader.sh"]
-    environment:
-      LOCALAI_API_KEY: "${LOCALAI_API_KEY:?}"
-      IDLE: "${LOCALAI_IDLE_UNLOAD:-2m}"
-    configs:
-      - source: idle-unloader
-        target: /idle-unloader.sh
     depends_on:
       frontend:
         condition: service_started
@@ -162,7 +72,7 @@ services:
       # Workers must know the registration token, so approving them by hand adds nothing here.
       LOCALAI_AUTO_APPROVE_NODES: "true"
       # Models load on demand: none while idle, one copy on the first request, more PCs
-      # only while all copies are busy (up to one copy per PC). idle-unloader unloads them.
+      # only while all copies are busy (up to one copy per PC). The proxy unloads them.
       LOCALAI_MODEL_SCHEDULING: '[{"model_name":"${LOCALAI_MODEL:-gemma-4-12B-it-qat-UD-Q4_K_XL}","min_replicas":0,"max_replicas":64},{"model_name":"${LOCALAI_EMBEDDING_MODEL:-Qwen3-Embedding-8B-Q4_K_M.gguf}","min_replicas":0,"max_replicas":64}]'
       # Model staging to a fresh worker over Wi-Fi can be slow: let requests wait for it.
       LOCALAI_MODEL_LOAD_WAIT: "${LOCALAI_MODEL_LOAD_WAIT:-10m}"

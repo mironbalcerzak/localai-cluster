@@ -1,18 +1,18 @@
-# LocalAI host: the server of the cluster. Started by ../../localai-host.sh / .bat.
+# LocalAI host: the server of the cluster. Started by ../../localai.sh host (or .bat).
 #
 #   frontend      API + web UI on :${LOCALAI_PORT}. Routes every request to a worker.
 #   worker-local  the GPU of this PC, registered as a worker like any other.
 #   postgres      users, API keys, node registry (required by distributed mode).
 #   nats          message bus; remote workers connect to :4222.
 #
-# Other PCs join with ../../localai-worker.sh / .bat.
-# Settings and secrets live in the .env next to the start scripts (created on the first start).
+# Other PCs join with ../../localai.sh worker (or .bat).
+# Settings and secrets live in the .env next to the start scripts (created by the host).
 
 name: ${COMPOSE_PROJECT_NAME:-localai}
 
 x-common-env: &common-env
   LOCALAI_NATS_URL: "nats://nats:4222"
-  LOCALAI_REGISTRATION_TOKEN: "${LOCALAI_REGISTRATION_TOKEN:?start with localai-host.sh / localai-host.bat, which creates .env}"
+  LOCALAI_REGISTRATION_TOKEN: "${LOCALAI_REGISTRATION_TOKEN:?start with localai.sh host / localai.bat host, which creates .env}"
   GODEBUG: "netdns=go"
 
 services:
@@ -50,7 +50,8 @@ services:
       LOCALAI_AUTH_DATABASE_URL: "postgresql://localai:${POSTGRES_PASSWORD}@postgres:5432/localai?sslmode=disable"
       # Workers must know the registration token, so approving them by hand adds nothing here.
       LOCALAI_AUTO_APPROVE_NODES: "true"
-      LOCALAI_MODEL_SCHEDULING_CONFIG: /etc/localai/scheduling.yaml
+      # One copy of LOCALAI_MODEL on every node, loaded as soon as the node joins.
+      LOCALAI_MODEL_SCHEDULING: '[{"model_name":"${LOCALAI_MODEL:-gemma-4-12b-it-Q4_K_M}","replicas":"all"}]'
       # Model staging to a fresh worker over Wi-Fi can be slow: let requests wait for it.
       LOCALAI_MODEL_LOAD_WAIT: "${LOCALAI_MODEL_LOAD_WAIT:-10m}"
       LOCALAI_NATS_MODEL_LOAD_TIMEOUT: "${LOCALAI_NATS_MODEL_LOAD_TIMEOUT:-}"
@@ -64,7 +65,6 @@ services:
       - models:/models
       - configuration:/configuration
       - data:/data
-      - ${LOCALAI_SCHEDULING_FILE:-./scheduling.yaml}:/etc/localai/scheduling.yaml:ro
     depends_on:
       postgres:
         condition: service_healthy

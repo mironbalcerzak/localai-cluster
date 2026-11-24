@@ -1,25 +1,20 @@
 # LocalAI cluster
 
 Several PCs with NVIDIA GPUs on one network serve LocalAI together. One PC is
-the **host**: it runs the API and web UI and uses its own GPU. The other PCs
-are **workers**: they join the host, get the model from it (gemma-4-12b by
-default) and take part of the requests. Each PC serves `LLAMACPP_PARALLEL`
-requests at once (5 by default), so every PC added raises the total.
+the **host**: it runs the API and web UI and uses its own GPU. The other PCs are
+**workers**: they join the host, get the model from it and take part of the
+requests. Each PC serves `LLAMACPP_PARALLEL` requests at once (5 by default), so
+every PC added raises the total.
 
 ```
-localai-host.sh / .bat     run the host
-localai-worker.sh / .bat   run a worker
-*.ps1                      the Windows logic behind the .bat files
-.env                       settings of this PC (host: created on first start,
-                           worker: the worker.env from the host)
-worker.env                 on the host: the settings to hand out to workers
-.env.example               template of the worker settings
-docker/host/               host compose file, scheduling.yaml
-docker/worker/             worker Dockerfile and compose file
+localai.sh / localai.bat   host | worker
+.env                       cluster settings, created by the host (gitignored)
+.env.example               the format of .env
+docker/host/               host compose stack (API, Postgres, NATS, local GPU worker)
+docker/worker/             worker image and compose file
 ```
 
-The `.bat` files can be double-clicked. Every script takes a command:
-`start` (default), `stop`, `update`, `status`, `logs`, plus the extras below.
+Both scripts run in the foreground and show the logs; Ctrl+C stops everything.
 
 ## Prerequisites (every PC)
 
@@ -48,37 +43,34 @@ Give every PC a fixed IP (DHCP reservation in the router).
 
 ## Host
 
-1. Run `localai-host.bat` (Windows) or `./localai-host.sh` (Linux). The first
-   start creates `.env` next to the script, with the settings and fresh secrets
-   of this host (port, parallel requests, API key, ...).
-2. Open `http://<host-ip>:23422` and sign up. The first account becomes admin;
-   later sign-ups wait for approval.
-3. The model must exist on the host: on a fresh host, install
-   `gemma-4-12b-it-Q4_K_M` in the web UI, or change `docker/host/scheduling.yaml`
-   to the model you use. That file decides which models every worker loads.
-4. Create the worker settings: `localai-host.bat worker-env` / `./localai-host.sh worker-env`.
-   This writes `worker.env` next to the script, with the host address, join token
-   and API key.
+```
+./localai.sh host        (Windows: localai.bat host)
+```
 
-Extras: `nodes` lists the workers, `api-key` prints the key for API clients
-(`Authorization: Bearer <key>`), `logs frontend` shows the logs of one service.
+The first run creates `.env` next to the script: the host's IP, a join token,
+the API key, the model (`LOCALAI_MODEL`, gemma-4-12b by default) and the
+database password. Then open `http://<host-ip>:23422` and sign up; the first
+account becomes admin, later sign-ups wait for approval. API clients send
+`Authorization: Bearer <LOCALAI_API_KEY>`.
+
+The model named in `LOCALAI_MODEL` must be installed on the host (web UI, Models);
+the host then loads it on every PC.
 
 ## Worker
 
-1. Check out this repo and save the `worker.env` from the host as `.env` next to
-   the scripts. (Without it, the first start creates `.env` from `.env.example`
-   and stops, so you can fill it in.) This PC's IP and name are detected
-   automatically; set `WORKER_IP` / `WORKER_NAME` in `.env` only to override them.
-2. Run `localai-worker.bat` (Windows) or `./localai-worker.sh` (Linux).
+1. Check out this repo and copy the host's `.env` next to the scripts.
+2. Run:
+   ```
+   ./localai.sh worker      (Windows: localai.bat worker)
+   ```
 
-The script builds the image, starts the worker, waits until it is registered and
-sends one test request for the model. The first start downloads the LocalAI
-image (~10 GB), then the CUDA backend (~3 GB) and the model from the host (~7 GB
-over Wi-Fi). They stay on the PC, so later starts are quick. The worker restarts
-with Docker automatically.
+This PC's IP and name are detected (override with `WORKER_IP` / `WORKER_NAME` in
+`.env`). The first run downloads the LocalAI image (~10 GB), then the CUDA backend
+(~3 GB) and the model from the host (~7 GB over Wi-Fi). They stay on the PC, so
+later runs are quick.
 
 ## Security notes
 
-- `.env` and `worker.env` hold the join token, API key and database password; they are gitignored.
+- `.env` holds the join token, API key and database password: share it only with your own PCs.
 - The message bus (NATS, port 4222) has no password: anyone on the network could
   send it commands. Fine on a home network, not on a shared one.

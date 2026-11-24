@@ -1,3 +1,2 @@
-# Settings with tokens, keys and passwords: never commit.
+# Cluster settings with tokens, keys and passwords: never commit.
 .env
-worker.env

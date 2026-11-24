@@ -1,6 +1,0 @@
-# Applied by the frontend on every start (authoritative for the models listed).
-# `replicas: all` = one copy of the model on every worker, loaded as soon as the
-# worker joins. Each copy serves LLAMACPP_PARALLEL requests at once, so total
-# parallelism = number of PCs x LLAMACPP_PARALLEL.
-- model_name: gemma-4-12b-it-Q4_K_M
-  replicas: all

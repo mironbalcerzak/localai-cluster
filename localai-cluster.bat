@@ -11,6 +11,10 @@ rem                        (slots per PC x PCs with it loaded; LOCALAI_MODEL by 
 rem                        Only the number goes to stdout; details go to stderr.
 rem   localai-cluster.bat model-list-all
 rem                        list every model of the host as "<model><TAB><capacity>".
+rem   localai-cluster.bat useChatCompletions [prompt] [model]
+rem                        send a prompt to the cluster (/v1/chat/completions) and print the
+rem                        reply. Without a prompt (or with "-") it is read from stdin. The
+rem                        model is LOCALAI_MODEL by default.
 setlocal EnableExtensions
 set "ROOT=%~dp0"
 set "ENV_FILE=%ROOT%.env"
@@ -19,7 +23,8 @@ if /i "%~1"=="host" goto :host
 if /i "%~1"=="worker" goto :worker
 if /i "%~1"=="model-capacity" goto :model_capacity
 if /i "%~1"=="model-list-all" goto :model_list_all
-echo Usage: %~nx0 host^|worker^|model-capacity [model]^|model-list-all
+if /i "%~1"=="useChatCompletions" goto :use_chat_completions
+echo Usage: %~nx0 host^|worker^|model-capacity [model]^|model-list-all^|useChatCompletions [prompt] [model]
 echo %CMDCMDLINE% | find /i "%~nx0" >nul && pause
 exit /b 2
 
@@ -84,6 +89,17 @@ exit /b 1
 call :load_env
 set "CAP_PS=$u='http://%LOCALAI_SERVER%:%LOCALAI_PORT%'; $h=@{Authorization='Bearer %LOCALAI_API_KEY%'}; function Fail($t) { [Console]::Error.WriteLine('Error: ' + $t); exit 1 }; function Cap($m) { try { $c = Invoke-RestMethod -TimeoutSec 10 -Headers $h ($u+'/api/models/config-json/'+$m) } catch { Fail ('cannot read the config of ' + $m + ' from ' + $u) }; try { $n = Invoke-RestMethod -TimeoutSec 10 -Headers $h ($u+'/api/nodes/models') } catch { Fail ('cannot read the loaded models from ' + $u) }; $s = 1; foreach ($o in @($c.options)) { if ($o -match '^(n_)?parallel:(\d+)$') { $s = [int]$Matches[2]; break } }; $l = @($n | Where-Object { $_.model_name -eq $m -and $_.state -eq 'loaded' }); $f = ($l | Measure-Object -Property in_flight -Sum).Sum; if (-not $f) { $f = 0 }; [pscustomobject]@{ Slots = $s; Replicas = $l.Count; InFlight = $f } };"
 exit /b 0
+
+rem ---------------------------------------------------------------- useChatCompletions
+rem The prompt and model reach PowerShell as environment variables, so their quotes and
+rem special characters need no escaping. Exit codes: 1 error, 3 reply cut off by the token limit.
+:use_chat_completions
+call :cap_init || exit /b 1
+set "CHAT_PROMPT=%~2"
+set "CHAT_MODEL=%~3"
+if not defined CHAT_MODEL set "CHAT_MODEL=%LOCALAI_MODEL%"
+powershell -NoProfile -Command "[Console]::OutputEncoding = [Text.Encoding]::UTF8; $p = $env:CHAT_PROMPT; if (-not $p -or $p -eq '-') { $p = [Console]::In.ReadToEnd() }; if (-not $p.Trim()) { [Console]::Error.WriteLine('Error: empty prompt'); exit 1 }; $body = @{ model = $env:CHAT_MODEL; stream = $false; messages = @(@{ role = 'user'; content = $p }) } | ConvertTo-Json -Depth 5; $h = @{ Authorization = 'Bearer ' + $env:LOCALAI_API_KEY }; $u = 'http://' + $env:LOCALAI_SERVER + ':' + $env:LOCALAI_PORT + '/v1/chat/completions'; try { $r = Invoke-RestMethod -Method Post -TimeoutSec 600 -Headers $h -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) $u } catch { $m = $_.ErrorDetails.Message; if (-not $m) { $m = $_.Exception.Message }; [Console]::Error.WriteLine('Error: ' + $m); exit 1 }; $c = $r.choices[0]; if ($c.message.content) { Write-Output $c.message.content }; if ($c.finish_reason -eq 'length') { [Console]::Error.WriteLine('Warning: the reply was cut off (token limit reached)'); exit 3 }; if (-not $c.message.content) { [Console]::Error.WriteLine('Error: the model returned an empty reply'); exit 1 }"
+exit /b %ERRORLEVEL%
 
 rem ---------------------------------------------------------------- helpers
 :check_docker

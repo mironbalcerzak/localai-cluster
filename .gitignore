@@ -1,5 +1,2 @@
 # Cluster settings with tokens, keys and passwords: never commit.
 .env
-
-# localai-mcp dependencies (npm install)
-node_modules/

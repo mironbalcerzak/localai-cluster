@@ -12,7 +12,6 @@ localai-cluster.sh / .bat   host | worker
 .env.example               the format of .env
 docker/host/               host compose stack (API, Postgres, NATS, local GPU worker)
 docker/worker/             worker image and compose file
-localai-mcp/               MCP server: available models, capacity, chat completions
 ```
 
 Both scripts run in the foreground and show the logs; Ctrl+C stops everything.
@@ -92,6 +91,20 @@ A model that is installed but not loaded on any PC shows 0.
 
 Both work on any PC that has the `.env`. The numbers change when PCs join or leave,
 so check them again from time to time.
+
+## Chat from the command line
+
+```
+./localai-cluster.sh useChatCompletions "prompt" [model]
+echo "prompt" | ./localai-cluster.sh useChatCompletions - [model]
+(Windows: localai-cluster.bat useChatCompletions "prompt" [model])
+```
+
+Sends the prompt to the cluster (`/v1/chat/completions`, `LOCALAI_MODEL` by default)
+and prints only the reply, so scripts can use it. Without a prompt, or with `-`, the
+prompt is read from stdin. The first request after a start loads the model and can
+take a minute. Exit codes: 1 on an error, 3 when the reply was cut off by the token
+limit. The Linux script needs `jq` or `python3`.
 
 ## Security notes
 

@@ -11,6 +11,10 @@
 #                         Only the number goes to stdout; details go to stderr.
 #   ./localai-cluster.sh model-list-all
 #                         list every model of the host as "<model><TAB><capacity>".
+#   ./localai-cluster.sh useChatCompletions [prompt] [model]
+#                         send a prompt to the cluster (/v1/chat/completions) and print the
+#                         reply. Without a prompt (or with "-") it is read from stdin. The
+#                         model is LOCALAI_MODEL by default. Needs jq or python3.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
@@ -109,6 +113,17 @@ model_capacity() {
     echo "${slots:-1} ${replicas:-0} ${in_flight}"
 }
 
+# chat_request PROMPT MODEL -> JSON body; chat_reply < RESPONSE -> "<finish_reason>\n<content>"
+if command -v jq >/dev/null; then
+    chat_request() { jq -n --arg p "$1" --arg m "$2" '{model: $m, stream: false, messages: [{role: "user", content: $p}]}'; }
+    chat_reply() { jq -r '(.choices[0].finish_reason // "") + "\n" + (.choices[0].message.content // "")'; }
+elif command -v python3 >/dev/null; then
+    chat_request() { python3 -c 'import json,sys; print(json.dumps({"model": sys.argv[2], "stream": False, "messages": [{"role": "user", "content": sys.argv[1]}]}))' "$1" "$2"; }
+    chat_reply() { python3 -c 'import json,sys; c=json.load(sys.stdin)["choices"][0]; print(c.get("finish_reason") or ""); print(c["message"].get("content") or "")'; }
+else
+    chat_request() { die "useChatCompletions needs jq or python3"; }
+fi
+
 case "${1:-}" in
     host)
         check_docker
@@ -149,8 +164,30 @@ case "${1:-}" in
             printf '%s\t%s\n' "$model" $(( slots * replicas ))
         done
         ;;
+    useChatCompletions)
+        api_init
+        prompt="${2:--}"
+        [[ "$prompt" == "-" ]] && prompt="$(cat)"
+        [[ -n "$prompt" ]] || die "empty prompt"
+        model="${3:-$(env_get LOCALAI_MODEL)}"
+        body="$(chat_request "$prompt" "$model")"
+        # Queue wait and model load included: allow up to 10 minutes.
+        response="$(curl -sS -m 600 -H "$API_AUTH" -H 'Content-Type: application/json' \
+            -d "$body" -w '\n%{http_code}' "${API_URL}/v1/chat/completions")" \
+            || die "cannot reach ${API_URL}"
+        code="${response##*$'\n'}"; response="${response%$'\n'*}"
+        [[ "$code" == 200 ]] || die "HTTP ${code}: ${response:0:500}"
+        reply="$(chat_reply <<<"$response")" || die "unexpected response: ${response:0:500}"
+        finish="${reply%%$'\n'*}"; content="${reply#*$'\n'}"
+        [[ -n "$content" ]] && printf '%s\n' "$content"
+        if [[ "$finish" == "length" ]]; then
+            echo "Warning: the reply was cut off (token limit reached)" >&2
+            exit 3
+        fi
+        [[ -n "$content" ]] || die "the model returned an empty reply"
+        ;;
     *)
-        echo "Usage: $0 host|worker|model-capacity [model]|model-list-all" >&2
+        echo "Usage: $0 host|worker|model-capacity [model]|model-list-all|useChatCompletions [prompt] [model]" >&2
         exit 2
         ;;
 esac

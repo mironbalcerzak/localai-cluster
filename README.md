@@ -58,8 +58,6 @@ it; no key, or a key LocalAI rejects (401), is replaced by `LOCALAI_API_KEY`. So
 that insist on sending a key work, and so do clients and the web UI without one (the
 UI opens as the admin "API Key User"; the add-on pages do not work under that user).
 The workers' own calls (`/api/node/*`) pass through unchanged, with their join token.
-The host still creates an admin account (`LOCALAI_ADMIN_EMAIL` /
-`LOCALAI_ADMIN_PASSWORD`) on its first start.
 
 **Models load on demand, and only `LOCALAI_MAX_LOADED_MODELS` at a time.** No model
 is loaded while the cluster is idle. The first request for a model loads one copy;
@@ -72,11 +70,16 @@ chat and embedding requests take turns, and each switch reloads a model. A model
 no requests for `LOCALAI_IDLE_UNLOAD` (2 minutes) is unloaded. The proxy logs every
 unload: `docker logs localai-proxy-1`.
 
-The model named in `LOCALAI_MODEL` must be installed on the host; the host then
-loads it on every PC. The default is `unsloth/gemma-4-12B-it-qat-GGUF` from Hugging
-Face: in the web UI, Models, search for it and install the UD-Q4_K_XL variant, which
-LocalAI names `gemma-4-12B-it-qat-UD-Q4_K_XL`. For another model or variant, put the
-name shown in the web UI into `LOCALAI_MODEL` (on the host and the workers) and restart.
+**Models install themselves.** When the host starts, its proxy checks that the chat
+model `LOCALAI_MODEL` and the embedding model `LOCALAI_EMBEDDING_MODEL` are installed and
+installs the missing ones from `LOCALAI_MODEL_URI` (with the variant `LOCALAI_MODEL_QUANT`)
+and `LOCALAI_EMBEDDING_MODEL_URI`. The defaults are the UD-Q4_K_XL variant of
+`unsloth/gemma-4-12B-it-qat-GGUF` and `Qwen3-Embedding-8B-Q4_K_M.gguf` from
+`Qwen/Qwen3-Embedding-8B-GGUF`, about 12 GB of downloads on a fresh host. Follow it
+with `docker logs -f localai-proxy-1`; a failed install is tried again after 10
+minutes. Workers install nothing: they get the files from the host the first time
+they load a model and keep them. For another model, set its name (as LocalAI names it
+after the install) and its source in `.env`, and restart the host.
 
 ## Worker
 
@@ -128,6 +131,6 @@ limit. The Linux script needs `jq` or `python3`.
 
 - Anyone who can reach the host's port is admin of LocalAI: they can use the API,
   install and delete models and change settings. Keep it on a home network.
-- `.env` holds the join token, API key, admin login and database password: share it only with your own PCs.
+- `.env` holds the join token, API key and database password: share it only with your own PCs.
 - The message bus (NATS, port 4222) has no password: anyone on the network could
   send it commands. Fine on a home network, not on a shared one.

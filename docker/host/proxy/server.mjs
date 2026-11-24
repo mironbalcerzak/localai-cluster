@@ -9,6 +9,9 @@
 //          recently used idle one is unloaded. If all loaded models are busy, the request
 //          waits (up to LOCALAI_EVICT_WAIT) instead of failing out of memory.
 // Idle     A model with no running requests and no use for LOCALAI_IDLE_UNLOAD is unloaded.
+// Install  At start, LOCALAI_MODEL and LOCALAI_EMBEDDING_MODEL are installed on the host when
+//          missing (from LOCALAI_MODEL_URI / LOCALAI_EMBEDDING_MODEL_URI). Workers get the
+//          files from the host the first time they load a model.
 //
 // Plain Node (no packages). Settings come from the environment (see docker-compose.yml).
 import http from "node:http";
@@ -24,6 +27,21 @@ const EVICT_WAIT_MS = parseDuration(process.env.LOCALAI_EVICT_WAIT || "10m");
 const KEY_CACHE_MS = 5 * 60_000;
 const MAX_JSON_BODY = 32 * 1024 * 1024;
 const IDLE_CHECK_MS = 15_000;
+const INSTALL_RETRY_MS = 10 * 60_000;
+
+// Models the cluster needs, installed at start when missing.
+const REQUIRED_MODELS = [
+  {
+    name: process.env.LOCALAI_MODEL,
+    uri: process.env.LOCALAI_MODEL_URI,
+    quant: process.env.LOCALAI_MODEL_QUANT,
+  },
+  {
+    name: process.env.LOCALAI_EMBEDDING_MODEL,
+    uri: process.env.LOCALAI_EMBEDDING_MODEL_URI,
+    embeddings: true,
+  },
+].filter((m) => m.name);
 
 // POST endpoints whose JSON body names the model they run on.
 const INFERENCE_PATHS = new Set([
@@ -227,6 +245,79 @@ async function unloadIdle() {
   });
 }
 
+// ---------------------------------------------------------------- install missing models
+
+async function installedModels() {
+  const r = await api("GET", "/v1/models");
+  if (r.status !== 200) throw new Error(`GET /v1/models: HTTP ${r.status}`);
+  return new Set((r.json?.data ?? []).map((m) => m.id));
+}
+
+// The import registers every GGUF as a chat model: switch embedding models over.
+async function markEmbeddings(name) {
+  const cfg = await api("GET", `/api/models/config-json/${encodeURIComponent(name)}`);
+  if (cfg.json?.embeddings === true) return;
+  const r = await api("PATCH", `/api/models/config-json/${encodeURIComponent(name)}`, {
+    embeddings: true,
+    known_usecases: ["embeddings"],
+  });
+  log(r.status === 200 ? `install: marked ${name} as an embedding model` : `install: could not mark ${name} as an embedding model: HTTP ${r.status}`);
+}
+
+// Install one model and wait for the download. Returns true when it is installed under its name.
+async function install(model) {
+  const body = { uri: model.uri, ...(model.quant && { preferences: { quantizations: model.quant } }) };
+  log(`install: ${model.name} is missing, installing it from ${model.uri}${model.quant ? ` (${model.quant})` : ""}`);
+  const r = await api("POST", "/models/import-uri", body);
+  const uuid = r.json?.uuid;
+  if (!uuid) {
+    log(`install: could not start the install of ${model.name}: HTTP ${r.status} ${r.text.slice(0, 300)}`);
+    return false;
+  }
+  if (r.json.estimated_size_display) log(`install: downloading about ${r.json.estimated_size_display}`);
+  let job = null;
+  for (let i = 0; ; i++) {
+    await sleep(5000);
+    job = (await api("GET", `/models/jobs/${uuid}`)).json;
+    if (job?.processed) break;
+    if (i % 12 === 11) log(`install: ${model.name} ${Math.floor(job?.progress ?? 0)}%`);
+  }
+  if (!(await installedModels()).has(model.name)) {
+    log(`install: ${model.name} did not install under that name (${job?.message || job?.error || "no message"}); ` +
+        `check the web UI, Models, and the model name in .env`);
+    return false;
+  }
+  log(`install: ${model.name} installed`);
+  return true;
+}
+
+let installing = false;
+async function ensureModels() {
+  if (installing) return;
+  installing = true;
+  let failed = false;
+  try {
+    while ((await api("GET", "/readyz").catch(() => ({ status: 0 }))).status !== 200) await sleep(3000);
+    for (const model of REQUIRED_MODELS) {
+      let ok = (await installedModels()).has(model.name);
+      if (ok) log(`install: ${model.name} is installed`);
+      else if (!model.uri) log(`install: ${model.name} is missing and has no source URI in .env`);
+      else ok = await install(model);
+      if (ok && model.embeddings) await markEmbeddings(model.name);
+      failed ||= !ok;
+    }
+  } catch (e) {
+    log(`install: ${e.message}`);
+    failed = true;
+  } finally {
+    installing = false;
+  }
+  if (failed) {
+    log(`install: trying again in ${INSTALL_RETRY_MS / 60_000} minutes`);
+    setTimeout(ensureModels, INSTALL_RETRY_MS);
+  }
+}
+
 // ---------------------------------------------------------------- forwarding
 
 function readBody(req, limit) {
@@ -348,4 +439,5 @@ server.listen(LISTEN_PORT, () => {
       `unload after ${IDLE_MS / 1000}s idle, wait up to ${EVICT_WAIT_MS / 1000}s for room`);
 });
 setInterval(() => unloadIdle().catch((e) => log(`idle check: ${e.message}`)), IDLE_CHECK_MS);
+ensureModels();
 for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => process.exit(0));

@@ -2,7 +2,8 @@
 #
 #   proxy         :${LOCALAI_PORT} on the network (Node, proxy/server.mjs). Fills in the
 #                 API key, keeps at most LOCALAI_MAX_LOADED_MODELS models loaded and
-#                 unloads models after LOCALAI_IDLE_UNLOAD without requests.
+#                 unloads models after LOCALAI_IDLE_UNLOAD without requests. Installs
+#                 LOCALAI_MODEL and LOCALAI_EMBEDDING_MODEL at start when missing.
 #   frontend      API + web UI. Routes every request to a worker.
 #   worker-local  the GPU of this PC, registered as a worker like any other.
 #   postgres      users, API keys, node registry (required by distributed mode).
@@ -53,6 +54,12 @@ services:
       LOCALAI_MAX_LOADED_MODELS: "${LOCALAI_MAX_LOADED_MODELS:-1}"
       LOCALAI_IDLE_UNLOAD: "${LOCALAI_IDLE_UNLOAD:-2m}"
       LOCALAI_EVICT_WAIT: "${LOCALAI_EVICT_WAIT:-10m}"
+      # Installed at start when missing (see proxy/server.mjs).
+      LOCALAI_MODEL: "${LOCALAI_MODEL:-gemma-4-12B-it-qat-UD-Q4_K_XL}"
+      LOCALAI_MODEL_URI: "${LOCALAI_MODEL_URI:-huggingface://unsloth/gemma-4-12B-it-qat-GGUF}"
+      LOCALAI_MODEL_QUANT: "${LOCALAI_MODEL_QUANT:-UD-Q4_K_XL}"
+      LOCALAI_EMBEDDING_MODEL: "${LOCALAI_EMBEDDING_MODEL:-Qwen3-Embedding-8B-Q4_K_M.gguf}"
+      LOCALAI_EMBEDDING_MODEL_URI: "${LOCALAI_EMBEDDING_MODEL_URI:-huggingface://Qwen/Qwen3-Embedding-8B-GGUF/Qwen3-Embedding-8B-Q4_K_M.gguf}"
     volumes:
       - ./proxy:/app:ro
     ports:
@@ -78,8 +85,8 @@ services:
       LOCALAI_MODEL_LOAD_WAIT: "${LOCALAI_MODEL_LOAD_WAIT:-10m}"
       LOCALAI_NATS_MODEL_LOAD_TIMEOUT: "${LOCALAI_NATS_MODEL_LOAD_TIMEOUT:-}"
       LOCALAI_API_KEY: "${LOCALAI_API_KEY:?}"
-      LOCALAI_ADMIN_EMAIL: "${LOCALAI_ADMIN_EMAIL:-}"
-      # The first account becomes admin; later sign-ups wait for admin approval.
+      # Nobody needs an account (the proxy signs requests with the API key): sign-ups made
+      # in the web UI anyway wait for approval.
       LOCALAI_REGISTRATION_MODE: "${LOCALAI_REGISTRATION_MODE:-approval}"
       LOCALAI_VRAM_WARM_LIMIT: "0"
       # Hardware auto-tuning is on: LocalAI picks the parallel request slots per model from

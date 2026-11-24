@@ -29,22 +29,6 @@ env_get() {
 # Source IP of this PC on the route towards $1.
 ip_towards() { ip -4 route get "$1" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1; }
 
-# Once the web UI answers: create the admin account from .env if nobody signed up yet.
-create_admin() {
-    local url email password
-    url="http://127.0.0.1:$(env_get LOCALAI_PORT)"
-    email="$(env_get LOCALAI_ADMIN_EMAIL)"; password="$(env_get LOCALAI_ADMIN_PASSWORD)"
-    [[ -n "$email" && -n "$password" ]] || return 0
-    for _ in $(seq 1 300); do
-        curl -sf -o /dev/null "${url}/readyz" && break
-        sleep 2
-    done
-    curl -sf "${url}/api/auth/status" | grep -q '"hasUsers":false' || return 0
-    curl -s -o /dev/null -H 'Content-Type: application/json' \
-        -d "{\"email\":\"${email}\",\"password\":\"${password}\",\"name\":\"admin\",\"acknowledge_weak_password\":true}" \
-        "${url}/api/auth/register"
-}
-
 check_docker() {
     command -v docker >/dev/null || die "Docker is not installed"
     docker info >/dev/null 2>&1 || die "Docker is not running, or this user may not use it (add yourself to the docker group)"
@@ -65,22 +49,21 @@ create_env() {
 LOCALAI_SERVER=${ip}
 LOCALAI_PORT=23422
 LOCALAI_REGISTRATION_TOKEN=$(openssl rand -hex 24)
-# Key for API clients: Authorization: Bearer <key>
+# Key the host's proxy adds to requests: clients and the web UI need none.
 LOCALAI_API_KEY=sk-$(openssl rand -hex 24)
-# Web UI login, created as admin on the host's first start. Must be an email address.
-LOCALAI_ADMIN_EMAIL=admin@localai
-LOCALAI_ADMIN_PASSWORD=admin123456
 
-# Model loaded on every PC. Parallel requests per PC are picked by LocalAI from the
-# GPU's VRAM; LLAMACPP_PARALLEL is used only when it picks none.
+# Chat and embedding model. Parallel requests per PC are picked by LocalAI from the GPU's VRAM.
 LOCALAI_MODEL=gemma-4-12B-it-qat-UD-Q4_K_XL
 LOCALAI_EMBEDDING_MODEL=Qwen3-Embedding-8B-Q4_K_M.gguf
+# Where the host's proxy installs the models from when they are missing.
+LOCALAI_MODEL_URI=huggingface://unsloth/gemma-4-12B-it-qat-GGUF
+LOCALAI_MODEL_QUANT=UD-Q4_K_XL
+LOCALAI_EMBEDDING_MODEL_URI=huggingface://Qwen/Qwen3-Embedding-8B-GGUF/Qwen3-Embedding-8B-Q4_K_M.gguf
 # Models load on the first request and unload after this long without one.
 LOCALAI_IDLE_UNLOAD=2m
 # How many different models may be loaded at once in the cluster. Loading another
 # one first unloads the least recently used idle model.
 LOCALAI_MAX_LOADED_MODELS=1
-LLAMACPP_PARALLEL=5
 
 # Used by the host only.
 LOCALAI_BIND=0.0.0.0
@@ -94,14 +77,14 @@ EOF
     echo "Created ${ENV_FILE}: copy it next to localai-cluster.sh / localai-cluster.bat on every worker PC."
 }
 
-# --- host API, for model-capacity / model-list-all (works from any PC with the .env)
+# --- host API, for the commands below (works from any PC with the .env). The host's
+# proxy adds the API key, so requests need none.
 api_init() {
     [[ -f "$ENV_FILE" ]] || die "missing ${ENV_FILE}"
     command -v curl >/dev/null || die "curl is needed"
     API_URL="http://$(env_get LOCALAI_SERVER):$(env_get LOCALAI_PORT)"
-    API_AUTH="Authorization: Bearer $(env_get LOCALAI_API_KEY)"
 }
-api_get() { curl -sf -m 10 -H "$API_AUTH" "${API_URL}$1"; }
+api_get() { curl -sf -m 10 "${API_URL}$1"; }
 
 # model_capacity MODEL -> "slots replicas in_flight"
 #   slots:     "parallel:N" in the effective config (auto-tuned or set), else 1
@@ -136,8 +119,7 @@ case "${1:-}" in
         [[ -f "$ENV_FILE" ]] || create_env
         export LOCALAI_LOCAL_NODE_NAME="$(hostname)"
         echo "LocalAI host: http://127.0.0.1:$(env_get LOCALAI_PORT)  (LAN: http://$(env_get LOCALAI_SERVER):$(env_get LOCALAI_PORT))"
-        echo "No login or API key needed: the host adds the key to every request. Ctrl+C stops it."
-        create_admin >/dev/null 2>&1 &
+        echo "No login or API key needed. Missing models are installed on start. Ctrl+C stops it."
         exec docker compose -p localai --env-file "$ENV_FILE" -f "${ROOT}/docker/host/docker-compose.yml" up
         ;;
     worker)
@@ -177,7 +159,7 @@ case "${1:-}" in
         model="${3:-$(env_get LOCALAI_MODEL)}"
         body="$(chat_request "$prompt" "$model")"
         # Queue wait and model load included: allow up to 10 minutes.
-        response="$(curl -sS -m 600 -H "$API_AUTH" -H 'Content-Type: application/json' \
+        response="$(curl -sS -m 600 -H 'Content-Type: application/json' \
             -d "$body" -w '\n%{http_code}' "${API_URL}/v1/chat/completions")" \
             || die "cannot reach ${API_URL}"
         code="${response##*$'\n'}"; response="${response%$'\n'*}"

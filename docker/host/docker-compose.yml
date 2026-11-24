@@ -100,8 +100,8 @@ services:
       # Hardware auto-tuning is on: LocalAI picks the parallel request slots per model from
       # the GPU's VRAM, and that wins over LLAMACPP_PARALLEL (only a fallback now). Set
       # LOCALAI_DISABLE_HARDWARE_DEFAULTS=true here to use LLAMACPP_PARALLEL instead.
-      # Context for models whose YAML sets none (12k tokens), shared by the slots of a PC.
-      LOCALAI_CONTEXT_SIZE: "${LOCALAI_CONTEXT_SIZE:-12288}"
+      # Context for models whose YAML sets none (32k tokens), shared by the slots of a PC.
+      LOCALAI_CONTEXT_SIZE: "${LOCALAI_CONTEXT_SIZE:-32768}"
       MODELS_PATH: /models
     volumes:
       - models:/models
@@ -127,6 +127,8 @@ services:
       LOCALAI_ADVERTISE_HTTP_ADDR: "worker-local:50050"
       LOCALAI_NODE_LABELS: "gpu=nvidia"
       LLAMACPP_PARALLEL: "${LLAMACPP_PARALLEL:-5}"
+      # Same context as the frontend's (32k tokens), shared by the slots of this PC.
+      LOCALAI_CONTEXT_SIZE: "${LOCALAI_CONTEXT_SIZE:-32768}"
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
       MODELS_PATH: /models
       # Folders the entrypoint hands over to the unprivileged localai user.

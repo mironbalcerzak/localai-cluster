@@ -17,6 +17,8 @@ services:
       WORKER_IP: "${WORKER_IP:?start with localai-cluster.sh worker / localai-cluster.bat worker, or set WORKER_IP in .env}"
       WORKER_NAME: "${WORKER_NAME:-}"
       LLAMACPP_PARALLEL: "${LLAMACPP_PARALLEL:-5}"
+      # Same context as the host's (32k tokens), shared by the slots of this PC.
+      LOCALAI_CONTEXT_SIZE: "${LOCALAI_CONTEXT_SIZE:-32768}"
       # The CUDA library (compute) and nvidia-smi (utility), as for the host's own worker.
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
     ports:

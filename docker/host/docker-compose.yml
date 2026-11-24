@@ -1,0 +1,125 @@
+# LocalAI host: the server of the cluster. Started by ../../localai-host.sh / .bat.
+#
+#   frontend      API + web UI on :${LOCALAI_PORT}. Routes every request to a worker.
+#   worker-local  the GPU of this PC, registered as a worker like any other.
+#   postgres      users, API keys, node registry (required by distributed mode).
+#   nats          message bus; remote workers connect to :4222.
+#
+# Other PCs join with ../../localai-worker.sh / .bat.
+# Settings and secrets live in .env next to this file (created by the host script).
+
+name: ${COMPOSE_PROJECT_NAME:-localai}
+
+x-common-env: &common-env
+  LOCALAI_NATS_URL: "nats://nats:4222"
+  LOCALAI_REGISTRATION_TOKEN: "${LOCALAI_REGISTRATION_TOKEN:?start with localai-host.sh / localai-host.bat to create docker/host/.env}"
+  GODEBUG: "netdns=go"
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: localai
+      POSTGRES_USER: localai
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?}"
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U localai"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  nats:
+    image: nats:2-alpine
+    restart: unless-stopped
+    command: ["--js", "-m", "8222"]
+    ports:
+      - "${LOCALAI_BIND:-0.0.0.0}:4222:4222"
+
+  frontend:
+    image: localai/localai:latest-gpu-nvidia-cuda-12
+    restart: unless-stopped
+    ports:
+      - "${LOCALAI_BIND:-0.0.0.0}:${LOCALAI_PORT:-23422}:8080"
+    environment:
+      <<: *common-env
+      LOCALAI_DISTRIBUTED: "true"
+      LOCALAI_AUTH: "true"
+      LOCALAI_AUTH_DATABASE_URL: "postgresql://localai:${POSTGRES_PASSWORD}@postgres:5432/localai?sslmode=disable"
+      # Workers must know the registration token, so approving them by hand adds nothing here.
+      LOCALAI_AUTO_APPROVE_NODES: "true"
+      LOCALAI_MODEL_SCHEDULING_CONFIG: /etc/localai/scheduling.yaml
+      # Model staging to a fresh worker over Wi-Fi can be slow: let requests wait for it.
+      LOCALAI_MODEL_LOAD_WAIT: "${LOCALAI_MODEL_LOAD_WAIT:-10m}"
+      LOCALAI_NATS_MODEL_LOAD_TIMEOUT: "${LOCALAI_NATS_MODEL_LOAD_TIMEOUT:-}"
+      LOCALAI_API_KEY: "${LOCALAI_API_KEY:-}"
+      LOCALAI_ADMIN_EMAIL: "${LOCALAI_ADMIN_EMAIL:-}"
+      # The first account becomes admin; later sign-ups wait for admin approval.
+      LOCALAI_REGISTRATION_MODE: "${LOCALAI_REGISTRATION_MODE:-approval}"
+      LOCALAI_VRAM_WARM_LIMIT: "0"
+      MODELS_PATH: /models
+    volumes:
+      - models:/models
+      - configuration:/configuration
+      - data:/data
+      - ${LOCALAI_SCHEDULING_FILE:-./scheduling.yaml}:/etc/localai/scheduling.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
+
+  worker-local:
+    image: localai/localai:latest-gpu-nvidia-cuda-12
+    restart: unless-stopped
+    init: true
+    command: ["worker"]
+    environment:
+      <<: *common-env
+      LOCALAI_REGISTER_TO: "http://frontend:8080"
+      LOCALAI_NODE_NAME: "${LOCALAI_LOCAL_NODE_NAME:-server}"
+      LOCALAI_SERVE_ADDR: "0.0.0.0:50051"
+      LOCALAI_ADVERTISE_ADDR: "worker-local:50051"
+      LOCALAI_ADVERTISE_HTTP_ADDR: "worker-local:50050"
+      LOCALAI_NODE_LABELS: "gpu=nvidia"
+      LLAMACPP_PARALLEL: "${LLAMACPP_PARALLEL:-5}"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      MODELS_PATH: /models
+      # Folders the entrypoint hands over to the unprivileged localai user.
+      LOCALAI_DATA_DIRS: "/models /backends /staging /cache"
+    volumes:
+      - worker_models:/models
+      - backends:/backends
+      - worker_staging:/staging
+      - worker_cache:/cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, utility]
+    depends_on:
+      frontend:
+        condition: service_started
+
+volumes:
+  postgres:
+    name: ${COMPOSE_PROJECT_NAME:-localai}_postgres
+  # Fixed names: an existing LocalAI install with these volumes keeps its models and settings.
+  models:
+    name: localai_models
+  configuration:
+    name: localai_configuration
+  data:
+    name: localai_data
+  backends:
+    name: localai_backends
+  worker_models:
+    name: ${COMPOSE_PROJECT_NAME:-localai}_worker_models
+  worker_staging:
+    name: ${COMPOSE_PROJECT_NAME:-localai}_worker_staging
+  worker_cache:
+    name: ${COMPOSE_PROJECT_NAME:-localai}_worker_cache

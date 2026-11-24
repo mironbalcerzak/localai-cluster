@@ -1,3 +1,3 @@
-# Configured worker settings with the join token: never commit.
-docker/.env
+# Generated settings with tokens and passwords: never commit.
+docker/*/.env
 .env

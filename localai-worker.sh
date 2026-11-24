@@ -4,17 +4,17 @@
 #   ./localai-worker.sh [start]   build, start and test (default)
 #   ./localai-worker.sh stop | logs | status | update
 #
-# Needs docker/.env (copy of .env.example with the server values filled in).
+# Needs docker/worker/.env (copy of .env.example with the server values filled in).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-COMPOSE_FILE="${ROOT}/docker/docker-compose.yml"
-ENV_FILE="${ROOT}/docker/.env"
+COMPOSE_FILE="${ROOT}/docker/worker/docker-compose.yml"
+ENV_FILE="${ROOT}/docker/worker/.env"
 CONTAINER="localai-worker"
 
 die() { echo "Error: $*" >&2; exit 1; }
 
-# Value of KEY from docker/.env (without surrounding quotes, CR or inline comment).
+# Value of KEY from docker/worker/.env (without surrounding quotes, CR or inline comment).
 env_get() {
     sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$ENV_FILE" | tail -1 \
         | sed 's/[[:space:]]*#.*$//; s/\r$//; s/^"\(.*\)"$/\1/; s/[[:space:]]*$//'
@@ -27,8 +27,8 @@ check_prereqs() {
     docker info >/dev/null 2>&1 || die "Docker is not running, or this user may not use it (add yourself to the docker group)"
     docker compose version >/dev/null 2>&1 || die "Docker Compose plugin is missing (package docker-compose-plugin)"
     [[ -f "$ENV_FILE" ]] || die "missing ${ENV_FILE}: put the configured .env there (template: .env.example)"
-    [[ -n "$(env_get LOCALAI_SERVER)" ]] || die "LOCALAI_SERVER is empty in docker/.env"
-    [[ -n "$(env_get LOCALAI_REGISTRATION_TOKEN)" ]] || die "LOCALAI_REGISTRATION_TOKEN is empty in docker/.env"
+    [[ -n "$(env_get LOCALAI_SERVER)" ]] || die "LOCALAI_SERVER is empty in docker/worker/.env"
+    [[ -n "$(env_get LOCALAI_REGISTRATION_TOKEN)" ]] || die "LOCALAI_REGISTRATION_TOKEN is empty in docker/worker/.env"
 }
 
 # WORKER_IP / WORKER_NAME: from .env, else detected. Exported for compose.
@@ -38,7 +38,7 @@ resolve_identity() {
     ip="$(env_get WORKER_IP)"
     if [[ -z "$ip" ]]; then
         ip="$(ip -4 route get "$server" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
-        [[ -n "$ip" ]] || die "cannot detect this PC's IP towards ${server}; set WORKER_IP in docker/.env"
+        [[ -n "$ip" ]] || die "cannot detect this PC's IP towards ${server}; set WORKER_IP in docker/worker/.env"
     fi
     name="$(env_get WORKER_NAME)"
     export WORKER_IP="$ip" WORKER_NAME="${name:-$(hostname)}"
@@ -67,7 +67,7 @@ test_request() {
     server="$(env_get LOCALAI_SERVER)"; port="$(env_get LOCALAI_SERVER_PORT)"; port="${port:-23422}"
     key="$(env_get LOCALAI_API_KEY)"; model="$(env_get LOCALAI_MODEL)"
     if [[ -z "$key" || -z "$model" ]]; then
-        echo "Skipping the test request (LOCALAI_API_KEY or LOCALAI_MODEL empty in docker/.env)."
+        echo "Skipping the test request (LOCALAI_API_KEY or LOCALAI_MODEL empty in docker/worker/.env)."
         return 0
     fi
     url="http://${server}:${port}/v1/chat/completions"

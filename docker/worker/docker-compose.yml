@@ -20,7 +20,7 @@ services:
     ports:
       - "50050-50059:50050-50059"
     volumes:
-      - models:/models       # copy of the models, sent by the server on first use
+      - models:/models       # copy of the host's models, kept current by the sync service
       - backends:/backends   # llama.cpp CUDA backend, downloaded on first use
       - staging:/staging
       - cache:/cache

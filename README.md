@@ -93,8 +93,8 @@ and `LOCALAI_EMBEDDING_MODEL_URI`. The defaults are the UD-Q4_K_XL variant of
 `unsloth/gemma-4-12B-it-qat-GGUF` and `Qwen3-Embedding-8B-Q4_K_M.gguf` from
 `Qwen/Qwen3-Embedding-8B-GGUF`, about 12 GB of downloads on a fresh host. Follow it
 with `docker logs -f localai-proxy-1`; a failed install is tried again after 10
-minutes. Workers install nothing: they get the files from the host the first time
-they load a model and keep them. For another model, set its name (as LocalAI names it
+minutes. Workers install nothing: their sync service downloads the host's model files
+ahead of time and keeps them, so a load there starts at once. For another model, set its name (as LocalAI names it
 after the install) and its source in `.env`, and restart the host.
 
 ## Worker

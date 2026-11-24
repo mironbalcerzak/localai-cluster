@@ -83,8 +83,9 @@ services:
       LOCALAI_AUTH_DATABASE_URL: "postgresql://localai:${POSTGRES_PASSWORD}@postgres:5432/localai?sslmode=disable"
       # Workers must know the registration token, so approving them by hand adds nothing here.
       LOCALAI_AUTO_APPROVE_NODES: "true"
-      # Models load on demand: none while idle, one copy on the first request, more PCs
-      # only while all copies are busy (up to one copy per PC). The proxy unloads them.
+      # Starting point: models load on demand (none while idle, one copy on the first
+      # request). Once a model is loaded, the proxy switches it to a copy on every PC
+      # (spread_all) and back to this before unloading it.
       LOCALAI_MODEL_SCHEDULING: '[{"model_name":"${LOCALAI_MODEL:-gemma-4-12B-it-qat-UD-Q4_K_XL}","min_replicas":0,"max_replicas":64},{"model_name":"${LOCALAI_EMBEDDING_MODEL:-Qwen3-Embedding-8B-Q4_K_M.gguf}","min_replicas":0,"max_replicas":64}]'
       # Model staging to a fresh worker over Wi-Fi can be slow: let requests wait for it.
       LOCALAI_MODEL_LOAD_WAIT: "${LOCALAI_MODEL_LOAD_WAIT:-10m}"

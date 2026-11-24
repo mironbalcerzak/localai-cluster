@@ -93,29 +93,39 @@ api_init() {
 }
 api_get() { curl -sf -m 10 "${API_URL}$1"; }
 
+# urlenc TEXT: TEXT encoded for a URL path segment. re_esc TEXT: TEXT as a literal in grep -E.
+urlenc() {
+    if command -v jq >/dev/null; then jq -rn --arg s "$1" '$s | @uri'
+    elif command -v python3 >/dev/null; then python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+    else printf '%s' "$1"; fi
+}
+re_esc() { sed 's/[][\.*^$+?(){}|/]/\\&/g' <<<"$1"; }
+
 # model_capacity MODEL -> "slots replicas in_flight"
 #   slots:     "parallel:N" in the effective config (auto-tuned or set), else 1
 #   replicas:  copies of the model in state "loaded" (one per PC)
 #   in_flight: requests running on those copies right now
 model_capacity() {
     local config nodes loaded slots replicas in_flight
-    config="$(api_get "/api/models/config-json/$1")" || die "cannot read the config of '$1' from ${API_URL}"
+    config="$(api_get "/api/models/config-json/$(urlenc "$1")")" || die "cannot read the config of '$1' from ${API_URL}"
     nodes="$(api_get /api/nodes/models)" || die "cannot read the loaded models from ${API_URL}"
     slots="$(grep -oE '"(n_)?parallel:[0-9]+"' <<<"$config" | head -1 | grep -oE '[0-9]+' || true)"
     # Each entry of /api/nodes/models is a flat JSON object.
-    loaded="$(grep -oE "\{[^{}]*\"model_name\":\"$1\"[^{}]*\}" <<<"$nodes" | grep '"state":"loaded"' || true)"
+    loaded="$(grep -oE "\{[^{}]*\"model_name\":\"$(re_esc "$1")\"[^{}]*\}" <<<"$nodes" | grep '"state":"loaded"' || true)"
     replicas="$(grep -c . <<<"$loaded" || true)"
     in_flight="$(grep -oE '"in_flight":[0-9]+' <<<"$loaded" | awk -F: '{n+=$2} END {print n+0}')"
     echo "${slots:-1} ${replicas:-0} ${in_flight}"
 }
 
-# chat_request PROMPT MODEL -> JSON body; chat_reply < RESPONSE -> "<finish_reason>\n<content>"
+# chat_request PROMPT MODEL -> JSON body
+# chat_reply < RESPONSE -> "<finish_reason>\n<content>\nEND". The END marker keeps an empty or
+# newline-ending reply intact through $(...), which strips trailing newlines.
 if command -v jq >/dev/null; then
     chat_request() { jq -n --arg p "$1" --arg m "$2" '{model: $m, stream: false, messages: [{role: "user", content: $p}]}'; }
-    chat_reply() { jq -r '(.choices[0].finish_reason // "") + "\n" + (.choices[0].message.content // "")'; }
+    chat_reply() { jq -r '(.choices[0].finish_reason // "") + "\n" + (.choices[0].message.content // "") + "\nEND"'; }
 elif command -v python3 >/dev/null; then
     chat_request() { python3 -c 'import json,sys; print(json.dumps({"model": sys.argv[2], "stream": False, "messages": [{"role": "user", "content": sys.argv[1]}]}))' "$1" "$2"; }
-    chat_reply() { python3 -c 'import json,sys; c=json.load(sys.stdin)["choices"][0]; print(c.get("finish_reason") or ""); print(c["message"].get("content") or "")'; }
+    chat_reply() { python3 -c 'import json,sys; c=json.load(sys.stdin)["choices"][0]; sys.stdout.write((c.get("finish_reason") or "") + "\n" + (c["message"].get("content") or "") + "\nEND\n")'; }
 else
     chat_request() { die "useChatCompletions needs jq or python3"; }
 fi
@@ -146,23 +156,25 @@ py_tsv() {
 import json, sys
 mode, d = sys.argv[1], json.load(sys.stdin)
 rows = {
-    "nodes":  lambda: [[n.get(k) or "" for k in ("name", "status", "address", "http_address", "last_heartbeat")] for n in d],
+    "nodes":  lambda: [[n.get(k) or "-" for k in ("name", "status", "address", "http_address", "last_heartbeat")] for n in d],
     "models": lambda: [[m["id"]] for m in d.get("data", [])],
-    "loaded": lambda: [[r["model_name"], r["state"], r.get("node_id") or ""] for r in d],
-    "gpus":   lambda: [[n.get(k) or "" for k in ("name", "id", "gpu_vendor", "total_vram", "address")] for n in d],
+    "loaded": lambda: [[r["model_name"], r["state"], r.get("node_id") or "-"] for r in d],
+    "gpus":   lambda: [[n.get(k) or "-" for k in ("name", "id", "gpu_vendor", "total_vram", "address", "available_vram")] for n in d],
 }[mode]()
 for r in rows: print("\t".join(str(x) for x in r))
 ' "$1"
 }
-nodes_tsv()  { if command -v jq >/dev/null; then jq -r '.[] | [.name, .status, .address, .http_address, .last_heartbeat] | @tsv'; else py_tsv nodes; fi; }
+# Empty fields come out as "-": read with IFS=$'\t' would collapse an empty field and shift the rest.
+JQ_DASH='map(if . == null or . == "" then "-" else tostring end) | @tsv'
+nodes_tsv()  { if command -v jq >/dev/null; then jq -r ".[] | [.name, .status, .address, .http_address, .last_heartbeat] | ${JQ_DASH}"; else py_tsv nodes; fi; }
 models_tsv() { if command -v jq >/dev/null; then jq -r '.data[].id'; else py_tsv models; fi; }
-loaded_tsv() { if command -v jq >/dev/null; then jq -r '.[] | [.model_name, .state, .node_id] | @tsv'; else py_tsv loaded; fi; }
-gpus_tsv()   { if command -v jq >/dev/null; then jq -r '.[] | [.name, .id, .gpu_vendor, .total_vram, .address] | @tsv'; else py_tsv gpus; fi; }
+loaded_tsv() { if command -v jq >/dev/null; then jq -r ".[] | [.model_name, .state, .node_id] | ${JQ_DASH}"; else py_tsv loaded; fi; }
+gpus_tsv()   { if command -v jq >/dev/null; then jq -r ".[] | [.name, .id, .gpu_vendor, .total_vram, .address, .available_vram] | ${JQ_DASH}"; else py_tsv gpus; fi; }
 
 # check_gpu URL CONTAINER NODE: does this PC's LocalAI worker run models on the GPU?
 # NODE is the worker's name as registered with the host ("worker-local" for the host's own).
 check_gpu() {
-    local url="$1" c="$2" node="$3" line id vendor vram gpu backend used total models
+    local url="$1" c="$2" node="$3" line="" id="" vendor="" vram="" avail="" gpu="" backend="" used="" total="" models=""
     section "GPU (this PC: ${c})"
     if command -v nvidia-smi >/dev/null; then
         gpu="$(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>/dev/null | head -1)"
@@ -171,12 +183,14 @@ check_gpu() {
         warn "nvidia-smi not found on this PC: is the NVIDIA driver installed?"
     fi
     if [[ -z "$(container_state "$c")" ]]; then fail "container ${c} does not exist: GPU checks skipped"; return; fi
-    gpu="$(docker exec "$c" nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)"
+    # On Windows (Docker Desktop, WSL 2) nvidia-smi is mounted at /usr/lib/wsl/lib, often not on PATH.
+    gpu="$(docker exec "$c" sh -c 'if command -v nvidia-smi >/dev/null 2>&1; then exec nvidia-smi "$@"; elif [ -x /usr/lib/wsl/lib/nvidia-smi ]; then exec /usr/lib/wsl/lib/nvidia-smi "$@"; else exit 127; fi' \
+        sh --query-gpu=name,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)"
     if [[ -n "$gpu" ]]; then
         IFS=',' read -r _ used total <<<"$gpu"; used="${used// /}"; total="${total// /}"
         ok "container ${c} sees the GPU: ${gpu%%,*} (${used} of ${total} MiB in use)"
     else
-        fail "container ${c} cannot see the GPU: models would run on the CPU. Linux: install the NVIDIA Container Toolkit; Windows: Docker Desktop with WSL 2 and an up-to-date NVIDIA driver"
+        warn "nvidia-smi does not run in container ${c}: LocalAI's own GPU figures below decide"
     fi
     backend="$(docker exec "$c" cat /backends/llama-cpp/metadata.json 2>/dev/null | sed -n 's/.*"meta_backend_for": *"\([^"]*\)".*/\1/p')"
     case "$backend" in
@@ -188,9 +202,14 @@ check_gpu() {
     if [[ -z "$line" ]]; then
         warn "LocalAI's view of this PC's GPU: not registered with the host"
     else
-        IFS=$'\t' read -r _ id vendor vram _ <<<"$line"
-        if [[ -n "$vendor" && "${vram:-0}" -gt 0 ]]; then ok "LocalAI sees a ${vendor} GPU with $(( vram / 1024 / 1024 / 1024 )) GB VRAM on this PC"
-        else fail "LocalAI sees no GPU on this PC (vendor '${vendor}', VRAM ${vram:-0}): models would run on the CPU"; fi
+        IFS=$'\t' read -r _ id vendor vram _ avail <<<"$line"
+        if [[ "$vendor" != "-" && "$vram" =~ ^[0-9]+$ ]] && (( vram > 0 )); then
+            ok "LocalAI sees a ${vendor} GPU with $(( vram / 1024 / 1024 / 1024 )) GB VRAM on this PC"
+            # Without nvidia-smi in the container, LocalAI's figures tell how much VRAM is in use.
+            if [[ -z "$used" && "$avail" =~ ^[0-9]+$ ]]; then used=$(( (vram - avail) / 1024 / 1024 )); fi
+        else
+            fail "LocalAI sees no GPU on this PC (vendor '${vendor}', VRAM ${vram}): models run on the CPU. Linux: install the NVIDIA Container Toolkit; Windows: Docker Desktop with WSL 2 and an up-to-date NVIDIA driver"
+        fi
         models="$(curl -sf -m 10 "${url}/api/nodes/models" | loaded_tsv | awk -F'\t' -v id="$id" '$3 == id && $2 == "loaded" {print $1}' | paste -sd, -)"
         if [[ -z "$models" ]]; then
             info "no model loaded on this PC right now: load one (send a request) and run diagnose again to see it on the GPU"
@@ -389,6 +408,7 @@ case "${1:-}" in
         served="$(sed -n 's/^[Xx]-[Cc]luster-[Ww]orker-[Ss]erved:[[:space:]]*//p' "$headers" | tr -d '\r' | tail -1)"
         [[ -n "$served" ]] && echo "served by: ${served}" >&2
         reply="$(chat_reply <<<"$response")" || die "unexpected response: ${response:0:500}"
+        reply="${reply%$'\n'END}"
         finish="${reply%%$'\n'*}"; content="${reply#*$'\n'}"
         [[ -n "$content" ]] && printf '%s\n' "$content"
         if [[ "$finish" == "length" ]]; then

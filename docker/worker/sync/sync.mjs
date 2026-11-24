@@ -8,7 +8,7 @@
 //
 // Plain Node (no packages). Settings come from the environment (see docker-compose.yml).
 import { createWriteStream } from "node:fs";
-import { chown, mkdir, rename, stat, unlink } from "node:fs/promises";
+import { chown, mkdir, readFile, rename, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { dirname, join, normalize, relative, sep } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -43,11 +43,22 @@ async function makeDirs(dir) {
   }
 }
 
+// Same file as the host's: same size and, when the host sends it, same modification time
+// (a downloaded file gets the host's time). Size alone would miss a replaced file.
+const sameFile = (st, file) => st?.size === file.size && (!file.mtime || Math.floor(st.mtimeMs) === file.mtime);
+
 async function download(model, file, dest) {
   const part = `${dest}.part`;
+  const tag = `${dest}.part.from`; // which host file the .part belongs to
   await makeDirs(dirname(dest));
   let have = (await stat(part).catch(() => null))?.size || 0;
-  if (have > file.size) { await unlink(part); have = 0; }
+  const from = `${file.size}:${file.mtime || 0}`;
+  // Resume only a .part of this very host file; one of an older version starts over.
+  if (have > file.size || (have && (await readFile(tag, "utf8").catch(() => "")) !== from)) {
+    await unlink(part).catch(() => {});
+    have = 0;
+  }
+  await writeFile(tag, from);
   log(`${model}: downloading ${file.path} (${gb(file.size)}${have ? `, resuming at ${gb(have)}` : ""})`);
   const res = await fetch(`${HOST_URL}/_cluster/files?path=${encodeURIComponent(file.path)}`, {
     headers: { "X-Registration-Token": TOKEN, ...(have && { Range: `bytes=${have}-` }) },
@@ -68,7 +79,9 @@ async function download(model, file, dest) {
   const size = (await stat(part)).size;
   if (size !== file.size) throw new Error(`${file.path}: got ${size} of ${file.size} bytes, will resume`);
   await chown(part, OWNER.uid, OWNER.gid).catch(() => {});
+  if (file.mtime) await utimes(part, new Date(), new Date(file.mtime));
   await rename(part, dest);
+  await unlink(tag).catch(() => {});
   log(`${model}: ${file.path} done`);
 }
 
@@ -84,7 +97,11 @@ async function syncOnce() {
     for (const file of model.files) {
       const dest = target(model.name, file.path);
       if (!dest) continue;
-      if ((await stat(dest).catch(() => null))?.size === file.size) continue;
+      const st = await stat(dest).catch(() => null);
+      if (sameFile(st, file)) continue;
+      // Same size, other time: a copy made before the host sent times. Adopt the host's time
+      // rather than download gigabytes again; a replaced file almost never keeps its size.
+      if (st?.size === file.size) { await utimes(dest, new Date(), new Date(file.mtime)).catch(() => {}); continue; }
       await download(model.name, file, dest);
       fetched++;
     }

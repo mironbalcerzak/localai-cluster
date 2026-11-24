@@ -8,7 +8,8 @@ rem                        copied next to this script.
 rem   localai-cluster.bat diagnose
 rem                        check the connections this PC needs: as host (LocalAI, NATS, every
 rem                        registered worker reachable from here) or as worker (host, token,
-rem                        registration, containers, model sync). Read-only.
+rem                        registration, containers, model sync), and whether this PC's
+rem                        models run on its GPU. Read-only.
 rem   localai-cluster.bat model-capacity [model]
 rem                        print how many requests the cluster serves at once for a model
 rem                        (slots per PC x PCs with it loaded; LOCALAI_MODEL by default).
@@ -74,7 +75,8 @@ rem ---------------------------------------------------------------- diagnose
 rem The checks are PowerShell, kept at the end of this file after the DIAGNOSE marker line:
 rem cmd never runs past the last "exit /b", and this reads that part and runs it.
 :diagnose
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$t = [IO.File]::ReadAllText('%~f0'); $i = $t.IndexOf('rem DIAGNOSE' + '-POWERSHELL'); $i = $t.IndexOf([char]10, $i) + 1; & ([scriptblock]::Create($t.Substring($i)))"
+set "DIAG_SELF=%~f0"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$t = [IO.File]::ReadAllText($env:DIAG_SELF); $i = $t.IndexOf('rem DIAGNOSE' + '-POWERSHELL'); $i = $t.IndexOf([char]10, $i) + 1; & ([scriptblock]::Create($t.Substring($i)))"
 exit /b %ERRORLEVEL%
 
 rem ---------------------------------------------------------------- model-capacity / model-list-all
@@ -86,7 +88,7 @@ rem PCs with the model loaded, and requests running on them now.
 call :cap_init || exit /b 1
 set "CAP_MODEL=%~2"
 if not defined CAP_MODEL set "CAP_MODEL=%LOCALAI_MODEL%"
-powershell -NoProfile -Command "%CAP_PS% $m='%CAP_MODEL%'; $r = Cap $m; [Console]::Error.WriteLine(\"model ${m}: $($r.Slots) slots/PC x $($r.Replicas) PCs loaded, $($r.InFlight) requests running\"); Write-Output ($r.Slots * $r.Replicas)"
+powershell -NoProfile -Command "%CAP_PS% $m=$env:CAP_MODEL; $r = Cap $m; [Console]::Error.WriteLine(\"model ${m}: $($r.Slots) slots/PC x $($r.Replicas) PCs loaded, $($r.InFlight) requests running\"); Write-Output ($r.Slots * $r.Replicas)"
 exit /b %ERRORLEVEL%
 
 :model_list_all
@@ -100,7 +102,7 @@ echo Error: missing "%ENV_FILE%" 1>&2
 exit /b 1
 :cap_env_ok
 call :load_env
-set "CAP_PS=$u='http://%LOCALAI_SERVER%:%LOCALAI_PORT%'; function Fail($t) { [Console]::Error.WriteLine('Error: ' + $t); exit 1 }; function Cap($m) { try { $c = Invoke-RestMethod -TimeoutSec 10 ($u+'/api/models/config-json/'+$m) } catch { Fail ('cannot read the config of ' + $m + ' from ' + $u) }; try { $n = Invoke-RestMethod -TimeoutSec 10 ($u+'/api/nodes/models') } catch { Fail ('cannot read the loaded models from ' + $u) }; $s = 1; foreach ($o in @($c.options)) { if ($o -match '^(n_)?parallel:(\d+)$') { $s = [int]$Matches[2]; break } }; $l = @($n | Where-Object { $_.model_name -eq $m -and $_.state -eq 'loaded' }); $f = ($l | Measure-Object -Property in_flight -Sum).Sum; if (-not $f) { $f = 0 }; [pscustomobject]@{ Slots = $s; Replicas = $l.Count; InFlight = $f } };"
+set "CAP_PS=$u='http://%LOCALAI_SERVER%:%LOCALAI_PORT%'; function Fail($t) { [Console]::Error.WriteLine('Error: ' + $t); exit 1 }; function Cap($m) { try { $c = Invoke-RestMethod -TimeoutSec 10 ($u+'/api/models/config-json/'+[uri]::EscapeDataString($m)) } catch { Fail ('cannot read the config of ' + $m + ' from ' + $u) }; try { $n = Invoke-RestMethod -TimeoutSec 10 ($u+'/api/nodes/models') } catch { Fail ('cannot read the loaded models from ' + $u) }; $s = 1; foreach ($o in @($c.options)) { if ($o -match '^(n_)?parallel:(\d+)$') { $s = [int]$Matches[2]; break } }; $l = @($n | Where-Object { $_.model_name -eq $m -and $_.state -eq 'loaded' }); $f = ($l | Measure-Object -Property in_flight -Sum).Sum; if (-not $f) { $f = 0 }; [pscustomobject]@{ Slots = $s; Replicas = $l.Count; InFlight = $f } };"
 exit /b 0
 
 rem ---------------------------------------------------------------- useChatCompletions
@@ -112,7 +114,7 @@ set "CHAT_PROMPT=%~2"
 set "CHAT_MODEL=%~3"
 set "CHAT_WORKER=%~4"
 if not defined CHAT_MODEL set "CHAT_MODEL=%LOCALAI_MODEL%"
-powershell -NoProfile -Command "[Console]::OutputEncoding = [Text.Encoding]::UTF8; $p = $env:CHAT_PROMPT; if (-not $p -or $p -eq '-') { $p = [Console]::In.ReadToEnd() }; if (-not $p.Trim()) { [Console]::Error.WriteLine('Error: empty prompt'); exit 1 }; $body = @{ model = $env:CHAT_MODEL; stream = $false; messages = @(@{ role = 'user'; content = $p }) } | ConvertTo-Json -Depth 5; $h = @{}; if ($env:CHAT_WORKER) { $h['X-Cluster-Worker'] = $env:CHAT_WORKER }; $u = 'http://' + $env:LOCALAI_SERVER + ':' + $env:LOCALAI_PORT + '/v1/chat/completions'; try { $w = Invoke-WebRequest -UseBasicParsing -Method Post -TimeoutSec 600 -Headers $h -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) $u } catch { $m = $_.ErrorDetails.Message; if (-not $m) { $m = $_.Exception.Message }; [Console]::Error.WriteLine('Error: ' + $m); exit 1 }; $r = [Text.Encoding]::UTF8.GetString($w.RawContentStream.ToArray()) | ConvertFrom-Json; $served = $w.Headers['X-Cluster-Worker-Served']; if ($served) { [Console]::Error.WriteLine('served by: ' + $served) }; $c = $r.choices[0]; if ($c.message.content) { Write-Output $c.message.content }; if ($c.finish_reason -eq 'length') { [Console]::Error.WriteLine('Warning: the reply was cut off (token limit reached)'); exit 3 }; if (-not $c.message.content) { [Console]::Error.WriteLine('Error: the model returned an empty reply'); exit 1 }"
+powershell -NoProfile -Command "[Console]::OutputEncoding = [Text.Encoding]::UTF8; [Console]::InputEncoding = New-Object Text.UTF8Encoding $false; $p = $env:CHAT_PROMPT; if (-not $p -or $p -eq '-') { $p = [Console]::In.ReadToEnd() }; if (-not $p.Trim()) { [Console]::Error.WriteLine('Error: empty prompt'); exit 1 }; $body = @{ model = $env:CHAT_MODEL; stream = $false; messages = @(@{ role = 'user'; content = $p }) } | ConvertTo-Json -Depth 5; $h = @{}; if ($env:CHAT_WORKER) { $h['X-Cluster-Worker'] = $env:CHAT_WORKER }; $u = 'http://' + $env:LOCALAI_SERVER + ':' + $env:LOCALAI_PORT + '/v1/chat/completions'; try { $w = Invoke-WebRequest -UseBasicParsing -Method Post -TimeoutSec 600 -Headers $h -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) $u } catch { $m = $_.ErrorDetails.Message; if (-not $m) { $m = $_.Exception.Message }; [Console]::Error.WriteLine('Error: ' + $m); exit 1 }; $r = [Text.Encoding]::UTF8.GetString($w.RawContentStream.ToArray()) | ConvertFrom-Json; $served = $w.Headers['X-Cluster-Worker-Served']; if ($served) { [Console]::Error.WriteLine('served by: ' + $served) }; $c = $r.choices[0]; if ($c.message.content) { Write-Output $c.message.content }; if ($c.finish_reason -eq 'length') { [Console]::Error.WriteLine('Warning: the reply was cut off (token limit reached)'); exit 3 }; if (-not $c.message.content) { [Console]::Error.WriteLine('Error: the model returned an empty reply'); exit 1 }"
 exit /b %ERRORLEVEL%
 
 rem ---------------------------------------------------------------- helpers
@@ -209,7 +211,10 @@ function Test-Ready($Url) {
 }
 
 function Get-Json($Url, $Headers = @{}) {
-    try { return Invoke-RestMethod -TimeoutSec 10 -Headers $Headers $Url } catch { return $null }
+    # Assigned first: Windows PowerShell 5.1 writes a JSON array from Invoke-RestMethod as one
+    # object, so @(Get-Json ...) would hold the whole list as a single item.
+    try { $r = Invoke-RestMethod -TimeoutSec 10 -Headers $Headers $Url } catch { return $null }
+    return $r
 }
 
 function Get-ContainerState($Name) {
@@ -235,12 +240,13 @@ function Check-Gpu($Url, $Container, $Node) {
     } else { Warn 'nvidia-smi not found on this PC: is the NVIDIA driver installed?' }
     if (-not (Get-ContainerState $Container)) { Fail "container $Container does not exist: GPU checks skipped"; return }
     $used = $null
-    $g = docker exec $Container nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader,nounits 2>$null | Select-Object -First 1
+    # Docker Desktop (WSL 2) mounts nvidia-smi at /usr/lib/wsl/lib, often not on the PATH.
+    $g = docker exec $Container sh -c 'if command -v nvidia-smi >/dev/null 2>&1; then exec nvidia-smi "$@"; elif [ -x /usr/lib/wsl/lib/nvidia-smi ]; then exec /usr/lib/wsl/lib/nvidia-smi "$@"; else exit 127; fi' sh --query-gpu=name,memory.used,memory.total --format=csv,noheader,nounits 2>$null | Select-Object -First 1
     if ($LASTEXITCODE -eq 0 -and $g) {
         $p = "$g".Split(',') | ForEach-Object { $_.Trim() }
         $used = [int]$p[1]
         Ok "container $Container sees the GPU: $($p[0]) ($($p[1]) of $($p[2]) MiB in use)"
-    } else { Fail "container $Container cannot see the GPU: models would run on the CPU. Use Docker Desktop with WSL 2 and an up-to-date NVIDIA driver" }
+    } else { Warn "nvidia-smi does not run in container ${Container}: LocalAI's own GPU figures below decide" }
     $meta = docker exec $Container cat /backends/llama-cpp/metadata.json 2>$null | Out-String
     $backend = if ($meta -match '"meta_backend_for":\s*"([^"]*)"') { $Matches[1] } else { '' }
     if (-not $backend) { Info 'llama.cpp backend: not installed yet (the host installs it on the first model load)' }
@@ -248,8 +254,12 @@ function Check-Gpu($Url, $Container, $Node) {
     else { Fail "llama.cpp backend: $backend, not a CUDA build: models run on the CPU. Remove the worker's backends volume and restart it" }
     $n = @(Get-Json "$Url/api/nodes") | Where-Object { $_ -and ($_.name -eq $Node -or "$($_.address)" -like "${Node}:*") } | Select-Object -First 1
     if (-not $n) { Warn "LocalAI's view of this PC's GPU: not registered with the host"; return }
-    if ($n.gpu_vendor -and [double]$n.total_vram -gt 0) { Ok "LocalAI sees a $($n.gpu_vendor) GPU with $([math]::Round([double]$n.total_vram / 1GB)) GB VRAM on this PC" }
-    else { Fail "LocalAI sees no GPU on this PC (vendor '$($n.gpu_vendor)', VRAM $($n.total_vram)): models would run on the CPU" }
+    if ($n.gpu_vendor -and [double]$n.total_vram -gt 0) {
+        Ok "LocalAI sees a $($n.gpu_vendor) GPU with $([math]::Round([double]$n.total_vram / 1GB)) GB VRAM on this PC"
+        # Without nvidia-smi in the container, LocalAI's figures tell how much VRAM is in use.
+        if ($null -eq $used -and $null -ne $n.available_vram) { $used = [int](([double]$n.total_vram - [double]$n.available_vram) / 1MB) }
+    }
+    else { Fail "LocalAI sees no GPU on this PC (vendor '$($n.gpu_vendor)', VRAM $($n.total_vram)): models run on the CPU. Use Docker Desktop with WSL 2 and an up-to-date NVIDIA driver" }
     $models = @(Get-Json "$Url/api/nodes/models") | Where-Object { $_ -and $_.node_id -eq $n.id -and $_.state -eq 'loaded' } | ForEach-Object { $_.model_name }
     if (-not $models) { Info 'no model loaded on this PC right now: load one (send a request) and run diagnose again to see it on the GPU' }
     elseif ($null -ne $used -and $used -gt 1024) { Ok "loaded here: $($models -join ', '); the GPU holds $used MiB, so the model runs on the GPU" }

@@ -20,7 +20,7 @@
 //          /_cluster/files (needs the join token), so a load on a worker finds them in place.
 // Install  At start, LOCALAI_MODEL and LOCALAI_EMBEDDING_MODEL are installed on the host when
 //          missing (from LOCALAI_MODEL_URI / LOCALAI_EMBEDDING_MODEL_URI). Workers get the
-//          files from the host the first time they load a model.
+//          files ahead of time from their sync service (see Files).
 //
 // Plain Node (no packages). Settings come from the environment (see docker-compose.yml).
 import http from "node:http";
@@ -28,6 +28,7 @@ import { EventEmitter } from "node:events";
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import { join, normalize } from "node:path";
+import { pipeline } from "node:stream";
 
 const UPSTREAM_HOST = process.env.UPSTREAM_HOST || "frontend";
 const UPSTREAM_PORT = Number(process.env.UPSTREAM_PORT || 8080);
@@ -82,12 +83,17 @@ const agent = new http.Agent({ keepAlive: true, maxSockets: 512 });
 
 // ---------------------------------------------------------------- LocalAI API (default key)
 
-function api(method, path, body) {
+// Always settles: on an answer, an error, a connection dropped mid-answer, or after 60 s.
+// Most calls run inside exclusive(), so one that never settled would freeze the proxy.
+function api(method, path, body, timeoutMs = 60_000) {
   return new Promise((resolve, reject) => {
     const data = body === undefined ? null : Buffer.from(JSON.stringify(body));
+    let settled = false;
+    const fail = (e) => { if (!settled) { settled = true; clearTimeout(timer); req.destroy(); reject(e); } };
+    const timer = setTimeout(() => fail(new Error(`${method} ${path}: no answer in ${timeoutMs / 1000}s`)), timeoutMs);
     const req = http.request(
       {
-        agent, host: UPSTREAM_HOST, port: UPSTREAM_PORT, method, path, timeout: 60_000,
+        agent, host: UPSTREAM_HOST, port: UPSTREAM_PORT, method, path,
         headers: {
           Authorization: `Bearer ${DEFAULT_KEY}`,
           ...(data && { "Content-Type": "application/json", "Content-Length": data.length }),
@@ -96,7 +102,13 @@ function api(method, path, body) {
       (res) => {
         const chunks = [];
         res.on("data", (c) => chunks.push(c));
+        res.on("error", fail);
+        res.on("aborted", () => fail(new Error(`${method} ${path}: connection dropped`)));
+        res.on("close", () => { if (!res.complete) fail(new Error(`${method} ${path}: connection dropped`)); });
         res.on("end", () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
           const text = Buffer.concat(chunks).toString("utf8");
           let json = null;
           try { json = text ? JSON.parse(text) : null; } catch {}
@@ -104,8 +116,7 @@ function api(method, path, body) {
         });
       },
     );
-    req.on("timeout", () => req.destroy(new Error(`${method} ${path}: timeout`)));
-    req.on("error", reject);
+    req.on("error", fail);
     req.end(data);
   });
 }
@@ -133,8 +144,10 @@ async function credentialAccepted(headers) {
     req.on("error", () => resolve(0));
     req.end();
   });
-  if (status === 0) return true; // LocalAI unreachable: pass the key on, the request will fail anyway
-  const ok = status !== 401;
+  // Only a clear answer is remembered: 200 (key accepted) or 401 (rejected). Anything else,
+  // such as LocalAI still starting, passes the key on this once and checks it again next time.
+  if (status !== 200 && status !== 401) return true;
+  const ok = status === 200;
   keyCache.set(id, { ok, until: Date.now() + KEY_CACHE_MS });
   if (keyCache.size > 1000) keyCache.delete(keyCache.keys().next().value);
   return ok;
@@ -208,36 +221,56 @@ function exclusive(fn) {
 class Busy extends Error {}
 
 // Reserve a slot for one request on `model`, unloading idle models when the limit needs it.
+// Requests waiting, by model: for room under the limit, and for a pin on that model.
+const roomWaiting = new Map();
+const pinWaiting = new Map();
+const bump = (map, key, by) => { const n = (map.get(key) || 0) + by; if (n > 0) map.set(key, n); else map.delete(key); };
+
 async function admit(model, isGone) {
   const deadline = Date.now() + EVICT_WAIT_MS;
-  let announced = false;
-  for (;;) {
-    const ok = await exclusive(async () => {
-      const loaded = await loadedModels();
-      const occupied = new Set(loaded.keys());
-      for (const [name, u] of usage) if (u.active > 0) occupied.add(name);
-      if (occupied.has(model) || occupied.size < MAX_LOADED) {
+  let waiting = false;
+  try {
+    for (;;) {
+      const ok = await exclusive(async () => {
+        const loaded = await loadedModels();
+        const occupied = new Set(loaded.keys());
+        for (const [name, u] of usage) if (u.active > 0) occupied.add(name);
+        if (occupied.has(model)) {
+          // Take turns: while another model waits for room, or a pinned request waits for this
+          // model, new requests of this model wait too, so it drains and the other gets its turn.
+          const other = [...roomWaiting.keys()].some((m) => m !== model && !occupied.has(m));
+          if ((other && occupied.size >= MAX_LOADED) || (pinWaiting.has(model) && !pinned.has(model))) return false;
+          use(model).active++;
+          return true;
+        }
+        if (occupied.size < MAX_LOADED) {
+          use(model).active++;
+          return true;
+        }
+        const idle = [...occupied]
+          .filter((name) => name !== model && !(usage.get(name)?.active > 0) && !(loaded.get(name)?.inFlight > 0))
+          .sort((a, b) => lastUsed(a, loaded) - lastUsed(b, loaded));
+        const need = occupied.size - MAX_LOADED + 1;
+        if (idle.length < need) return false;
+        for (const name of idle.slice(0, need)) await unload(name, `${model} needs room, limit ${MAX_LOADED}`);
         use(model).active++;
         return true;
+      });
+      if (ok) return;
+      if (isGone()) throw new Busy("client gone");
+      if (Date.now() > deadline) throw new Busy(`no room for ${model}: the loaded model(s) stayed busy for ${EVICT_WAIT_MS / 1000}s`);
+      if (!waiting) {
+        log(`wait: ${model} waits for its turn (limit ${MAX_LOADED})`);
+        waiting = true;
+        bump(roomWaiting, model, 1);
       }
-      const idle = [...occupied]
-        .filter((name) => name !== model && !(usage.get(name)?.active > 0) && !(loaded.get(name)?.inFlight > 0))
-        .sort((a, b) => lastUsed(a, loaded) - lastUsed(b, loaded));
-      const need = occupied.size - MAX_LOADED + 1;
-      if (idle.length < need) return false;
-      for (const name of idle.slice(0, need)) await unload(name, `${model} needs room, limit ${MAX_LOADED}`);
-      use(model).active++;
-      return true;
-    });
-    if (ok) return;
-    if (isGone()) throw new Busy("client gone");
-    if (Date.now() > deadline) throw new Busy(`all ${MAX_LOADED} loaded model(s) stayed busy for ${EVICT_WAIT_MS / 1000}s`);
-    if (!announced) log(`wait: ${model} waits for a loaded model to become idle (limit ${MAX_LOADED})`);
-    announced = true;
-    await new Promise((r) => {
-      const t = setTimeout(r, 5000);
-      released.once("release", () => { clearTimeout(t); r(); });
-    });
+      await new Promise((r) => {
+        const t = setTimeout(r, 5000);
+        released.once("release", () => { clearTimeout(t); r(); });
+      });
+    }
+  } finally {
+    if (waiting) bump(roomWaiting, model, -1);
   }
 }
 
@@ -250,13 +283,23 @@ function release(model) {
 
 const lastUsed = (name, loaded) => Math.max(usage.get(name)?.lastUsed || 0, loaded.get(name)?.lastUsed || 0);
 
+const notReadySince = new Map(); // model -> since when a copy of it is not "loaded"
+
 async function unloadIdle() {
   await exclusive(async () => {
     const loaded = await loadedModels();
     const now = Date.now();
+    for (const name of notReadySince.keys()) if (!loaded.has(name)) notReadySince.delete(name);
     for (const [name, m] of loaded) {
       if (usage.get(name)?.active > 0 || m.inFlight > 0) continue;
-      if (!m.states.every((s) => s === "loaded")) continue; // still loading somewhere
+      // A copy still loading somewhere is left alone, but not for ever: one stuck for 10
+      // minutes (a PC that cannot load it) no longer keeps the model loaded everywhere.
+      if (!m.states.every((s) => s === "loaded")) {
+        if (!notReadySince.has(name)) notReadySince.set(name, now);
+        if (now - notReadySince.get(name) < 10 * 60_000) continue;
+      } else {
+        notReadySince.delete(name);
+      }
       if (now - lastUsed(name, loaded) < IDLE_MS) continue;
       await unload(name, `idle for ${Math.round((now - lastUsed(name, loaded)) / 1000)}s`);
     }
@@ -308,7 +351,9 @@ async function mirror() {
 
 // ---------------------------------------------------------------- pin a request to one worker
 
-const pinned = new Map(); // model -> worker name, while a pinned request runs
+// model -> { worker, refs }: refs counts the pinned requests that set or joined the pin and
+// are not finished. The pin is lifted when refs is 0 and no request of the model runs.
+const pinned = new Map();
 
 class PinError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -326,23 +371,27 @@ async function nodeName(id) {
 }
 
 // Move `model` to one worker for a request, then reserve a slot like admit(). Returns the
-// worker's name as LocalAI knows it.
+// worker's name as LocalAI knows it. On success the request holds one reference on the pin:
+// release it with dropPin() when the request ends.
 async function admitPinned(model, worker, isGone) {
   const node = (await workerNames()).find((n) => String(n.name).toLowerCase() === worker.toLowerCase());
   if (!node) throw new PinError(404, `no worker named "${worker}"; registered: ${[...nodeNames.values()].join(", ") || "none"}`);
   if (node.status !== "healthy") throw new PinError(503, `worker ${node.name} is ${node.status}`);
   const deadline = Date.now() + EVICT_WAIT_MS;
-  for (;;) {
-    const ready = await exclusive(async () => {
-      if (pinned.has(model) && pinned.get(model) !== node.name) return false; // another pinned test runs
-      const loaded = await loadedModels();
-      if (usage.get(model)?.active > 0 || loaded.get(model)?.inFlight > 0) return pinned.get(model) === node.name;
-      if (pinned.get(model) !== node.name) {
-        pinned.set(model, node.name);
-        if (!(await setScheduling(model, `pin:${node.name}`))) {
-          pinned.delete(model);
-          throw new PinError(502, `could not restrict ${model} to ${node.name}`);
+  bump(pinWaiting, model, 1); // holds back new unpinned requests of the model
+  try {
+    for (;;) {
+      const ready = await exclusive(async () => {
+        const p = pinned.get(model);
+        if (p) {
+          if (p.worker !== node.name) return false; // a pinned test on another PC runs
+          p.refs++; // join the pin that is in place
+          return true;
         }
+        const loaded = await loadedModels();
+        if (usage.get(model)?.active > 0 || loaded.get(model)?.inFlight > 0) return false;
+        if (!(await setScheduling(model, `pin:${node.name}`))) throw new PinError(502, `could not restrict ${model} to ${node.name}`);
+        pinned.set(model, { worker: node.name, refs: 1 });
         if (loaded.has(model)) {
           log(`pin: unload ${model} everywhere, to load it on ${node.name} only`);
           const r = await api("POST", "/backend/shutdown", { model });
@@ -350,26 +399,41 @@ async function admitPinned(model, worker, isGone) {
           for (let i = 0; i < 60 && (await loadedModels()).has(model); i++) await sleep(500);
           await sleep(1000);
         }
-      }
-      return true;
-    });
-    if (ready) break;
-    if (isGone()) throw new Busy("client gone");
-    if (Date.now() > deadline) throw new Busy(`${model} stayed busy for ${EVICT_WAIT_MS / 1000}s`);
-    await sleep(2000);
+        return true;
+      });
+      if (ready) break;
+      if (isGone()) throw new Busy("client gone");
+      if (Date.now() > deadline) throw new Busy(`${model} stayed busy for ${EVICT_WAIT_MS / 1000}s`);
+      await sleep(2000);
+    }
+  } finally {
+    bump(pinWaiting, model, -1);
   }
   log(`pin: ${model} request runs on ${node.name}`);
-  await admit(model, isGone);
+  try {
+    await admit(model, isGone);
+  } catch (e) {
+    await dropPin(model);
+    throw e;
+  }
   return node.name;
 }
 
-// After the last pinned request: lift the restriction; the mirror spreads the model again.
-async function unpin(model) {
-  if ((usage.get(model)?.active || 0) > 0) return;
+// Lift the pin when nothing uses it any more; the mirror then spreads the model again.
+// Call inside exclusive().
+async function unpinIfUnused(model) {
+  const p = pinned.get(model);
+  if (!p || p.refs > 0 || usage.get(model)?.active > 0) return;
+  await setScheduling(model, "demand");
+  pinned.delete(model);
+}
+
+// A pinned request ended (or failed after admitPinned): release its reference.
+async function dropPin(model) {
   await exclusive(async () => {
-    if (!pinned.has(model)) return;
-    await setScheduling(model, "demand");
-    pinned.delete(model);
+    const p = pinned.get(model);
+    if (p) p.refs = Math.max(0, p.refs - 1);
+    await unpinIfUnused(model);
   });
 }
 
@@ -389,7 +453,7 @@ async function manifest() {
       const rel = normalize(p).replace(/^\/+/, "");
       if (rel.startsWith("..")) continue;
       const st = await stat(join(MODELS_DIR, rel)).catch(() => null);
-      if (st?.isFile()) files.push({ path: rel, size: st.size });
+      if (st?.isFile()) files.push({ path: rel, size: st.size, mtime: Math.floor(st.mtimeMs) });
     }
     if (files.length) models.push({ name, files });
   }
@@ -421,7 +485,8 @@ async function serveFiles(req, res) {
     "Content-Length": file.size - start,
     ...(range && { "Content-Range": `bytes ${start}-${file.size - 1}/${file.size}` }),
   });
-  createReadStream(join(MODELS_DIR, file.path), { start }).on("error", () => res.destroy()).pipe(res);
+  // pipeline() also closes the file when the worker breaks the download off.
+  pipeline(createReadStream(join(MODELS_DIR, file.path), { start }), res, () => {});
 }
 
 // ---------------------------------------------------------------- install missing models
@@ -462,11 +527,25 @@ async function install(model) {
     return false;
   }
   if (r.json.estimated_size_display) log(`install: downloading about ${r.json.estimated_size_display}`);
+  // Wait for the job. Give up when LocalAI no longer knows it (it restarted) or when the
+  // progress stands still for 30 minutes; the 10-minute retry then starts it again.
   let job = null;
+  let progress = -1;
+  let movedAt = Date.now();
   for (let i = 0; ; i++) {
     await sleep(5000);
-    job = (await api("GET", `/models/jobs/${uuid}`)).json;
+    const r = await api("GET", `/models/jobs/${uuid}`).catch(() => null);
+    job = r?.json;
     if (job?.processed) break;
+    if (r && (r.status === 404 || job?.error)) {
+      log(`install: the install job of ${model.name} ended without finishing (${job?.error || job?.message || `HTTP ${r.status}`})`);
+      return false;
+    }
+    if ((job?.progress ?? -1) !== progress) { progress = job?.progress ?? -1; movedAt = Date.now(); }
+    if (Date.now() - movedAt > 30 * 60_000) {
+      log(`install: ${model.name} made no progress for 30 minutes`);
+      return false;
+    }
     if (i % 12 === 11) log(`install: ${model.name} ${Math.floor(job?.progress ?? 0)}%`);
   }
   if (!(await installedModels()).has(model.name)) {
@@ -545,7 +624,9 @@ function forward(req, res, headers, body, done = () => {}) {
       res.writeHead(upRes.statusCode, headers);
       upRes.pipe(res);
       upRes.on("end", finish);
-      upRes.on("error", finish);
+      // LocalAI broke off mid-answer: close the client's connection too, or it would hang.
+      upRes.on("error", () => { res.destroy(); finish(); });
+      upRes.on("aborted", () => { res.destroy(); finish(); });
     },
   );
   up.on("error", (e) => { sendError(res, 502, `LocalAI frontend: ${e.message}`); finish(); });
@@ -586,15 +667,16 @@ async function handle(req, res) {
     if (worker) await admitPinned(model, worker, () => gone);
     else await admit(model, () => gone);
   } catch (e) {
-    if (worker) unpin(model).catch(() => {});
     if (e instanceof PinError) return sendError(res, e.status, e.message);
     if (e instanceof Busy) return gone ? undefined : sendError(res, 503, e.message, { "Retry-After": "30" });
     log(`admit ${model}: ${e.message}`);
     return sendError(res, 502, `LocalAI frontend: ${e.message}`);
   }
+  // Every request of a pinned model may be the last one: pinned or not, it may lift the pin.
   const done = () => {
     release(model);
-    if (worker) unpin(model).catch((e) => log(`pin: ${e.message}`));
+    if (worker) dropPin(model).catch((e) => log(`pin: ${e.message}`));
+    else if (pinned.has(model)) exclusive(() => unpinIfUnused(model)).catch((e) => log(`pin: ${e.message}`));
   };
   if (gone) return done();
   forward(req, res, headers, body, done);
@@ -603,9 +685,14 @@ async function handle(req, res) {
 // WebSockets (web UI): pass the upgrade through with the same auth handling.
 async function handleUpgrade(req, socket, head) {
   const path = (req.url || "/").split("?")[0];
+  // Without an error listener, a client resetting the connection would crash the proxy.
+  let up = null;
+  socket.on("error", () => { up?.destroy(); socket.destroy(); });
+  socket.on("close", () => up?.destroy());
   try {
     const headers = await upstreamHeaders(req, path);
-    const up = http.request({ host: UPSTREAM_HOST, port: UPSTREAM_PORT, method: req.method, path: req.url, headers });
+    if (socket.destroyed) return;
+    up = http.request({ host: UPSTREAM_HOST, port: UPSTREAM_PORT, method: req.method, path: req.url, headers });
     up.on("upgrade", (upRes, upSocket, upHead) => {
       const lines = [`HTTP/1.1 ${upRes.statusCode} ${upRes.statusMessage}`];
       for (let i = 0; i < upRes.rawHeaders.length; i += 2) lines.push(`${upRes.rawHeaders[i]}: ${upRes.rawHeaders[i + 1]}`);
@@ -618,6 +705,7 @@ async function handleUpgrade(req, socket, head) {
     });
     up.on("response", (upRes) => {
       socket.write(`HTTP/1.1 ${upRes.statusCode} ${upRes.statusMessage}\r\nConnection: close\r\n\r\n`);
+      upRes.on("error", () => socket.destroy());
       upRes.pipe(socket);
     });
     up.on("error", () => socket.destroy());

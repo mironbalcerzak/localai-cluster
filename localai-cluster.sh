@@ -5,6 +5,12 @@
 #                         The first run creates .env next to this script.
 #   ./localai-cluster.sh worker   lend this PC's GPU to the host. Needs the host's .env
 #                         copied next to this script.
+#   ./localai-cluster.sh model-capacity [model]
+#                         print how many requests the cluster serves at once for a model
+#                         (slots per PC x PCs with it loaded; LOCALAI_MODEL by default).
+#                         Only the number goes to stdout; details go to stderr.
+#   ./localai-cluster.sh model-list-all
+#                         list every model of the host as "<model><TAB><capacity>".
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
@@ -61,8 +67,9 @@ LOCALAI_API_KEY=sk-$(openssl rand -hex 24)
 LOCALAI_ADMIN_EMAIL=admin@localai
 LOCALAI_ADMIN_PASSWORD=admin123456
 
-# Model loaded on every PC, and parallel requests per PC.
-LOCALAI_MODEL=gemma-4-12b-it-Q4_K_M
+# Model loaded on every PC. Parallel requests per PC are picked by LocalAI from the
+# GPU's VRAM; LLAMACPP_PARALLEL is used only when it picks none.
+LOCALAI_MODEL=gemma-4-12b-it-qat-q4_0
 LLAMACPP_PARALLEL=5
 
 # Used by the host only.
@@ -75,6 +82,31 @@ WORKER_NAME=
 EOF
     )
     echo "Created ${ENV_FILE}: copy it next to localai-cluster.sh / localai-cluster.bat on every worker PC."
+}
+
+# --- host API, for model-capacity / model-list-all (works from any PC with the .env)
+api_init() {
+    [[ -f "$ENV_FILE" ]] || die "missing ${ENV_FILE}"
+    command -v curl >/dev/null || die "curl is needed"
+    API_URL="http://$(env_get LOCALAI_SERVER):$(env_get LOCALAI_PORT)"
+    API_AUTH="Authorization: Bearer $(env_get LOCALAI_API_KEY)"
+}
+api_get() { curl -sf -m 10 -H "$API_AUTH" "${API_URL}$1"; }
+
+# model_capacity MODEL -> "slots replicas in_flight"
+#   slots:     "parallel:N" in the effective config (auto-tuned or set), else 1
+#   replicas:  copies of the model in state "loaded" (one per PC)
+#   in_flight: requests running on those copies right now
+model_capacity() {
+    local config nodes loaded slots replicas in_flight
+    config="$(api_get "/api/models/config-json/$1")" || die "cannot read the config of '$1' from ${API_URL}"
+    nodes="$(api_get /api/nodes/models)" || die "cannot read the loaded models from ${API_URL}"
+    slots="$(grep -oE '"(n_)?parallel:[0-9]+"' <<<"$config" | head -1 | grep -oE '[0-9]+' || true)"
+    # Each entry of /api/nodes/models is a flat JSON object.
+    loaded="$(grep -oE "\{[^{}]*\"model_name\":\"$1\"[^{}]*\}" <<<"$nodes" | grep '"state":"loaded"' || true)"
+    replicas="$(grep -c . <<<"$loaded" || true)"
+    in_flight="$(grep -oE '"in_flight":[0-9]+' <<<"$loaded" | awk -F: '{n+=$2} END {print n+0}')"
+    echo "${slots:-1} ${replicas:-0} ${in_flight}"
 }
 
 case "${1:-}" in
@@ -100,8 +132,25 @@ case "${1:-}" in
         echo "LocalAI worker '${WORKER_NAME}' (${WORKER_IP}) -> host ${server}. Ctrl+C stops it."
         exec docker compose -p localai-worker --env-file "$ENV_FILE" -f "${ROOT}/docker/worker/docker-compose.yml" up --build
         ;;
+    model-capacity)
+        api_init
+        model="${2:-$(env_get LOCALAI_MODEL)}"
+        cap="$(model_capacity "$model")" || exit 1
+        read -r slots replicas in_flight <<<"$cap"
+        echo "model ${model}: ${slots} slots/PC x ${replicas} PCs loaded, ${in_flight} requests running" >&2
+        echo $(( slots * replicas ))
+        ;;
+    model-list-all)
+        api_init
+        models="$(api_get /v1/models)" || die "cannot read the models from ${API_URL}"
+        for model in $(grep -oE '"id":"[^"]*"' <<<"$models" | cut -d'"' -f4); do
+            cap="$(model_capacity "$model")" || exit 1
+            read -r slots replicas in_flight <<<"$cap"
+            printf '%s\t%s\n' "$model" $(( slots * replicas ))
+        done
+        ;;
     *)
-        echo "Usage: $0 host|worker" >&2
+        echo "Usage: $0 host|worker|model-capacity [model]|model-list-all" >&2
         exit 2
         ;;
 esac

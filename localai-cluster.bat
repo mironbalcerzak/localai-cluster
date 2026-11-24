@@ -5,13 +5,21 @@ rem   localai-cluster.bat host     run the server (API + web UI) and use this PC
 rem                        The first run creates .env next to this script.
 rem   localai-cluster.bat worker   lend this PC's GPU to the host. Needs the host's .env
 rem                        copied next to this script.
+rem   localai-cluster.bat model-capacity [model]
+rem                        print how many requests the cluster serves at once for a model
+rem                        (slots per PC x PCs with it loaded; LOCALAI_MODEL by default).
+rem                        Only the number goes to stdout; details go to stderr.
+rem   localai-cluster.bat model-list-all
+rem                        list every model of the host as "<model><TAB><capacity>".
 setlocal EnableExtensions
 set "ROOT=%~dp0"
 set "ENV_FILE=%ROOT%.env"
 
 if /i "%~1"=="host" goto :host
 if /i "%~1"=="worker" goto :worker
-echo Usage: %~nx0 host^|worker
+if /i "%~1"=="model-capacity" goto :model_capacity
+if /i "%~1"=="model-list-all" goto :model_list_all
+echo Usage: %~nx0 host^|worker^|model-capacity [model]^|model-list-all
 echo %CMDCMDLINE% | find /i "%~nx0" >nul && pause
 exit /b 2
 
@@ -51,6 +59,31 @@ if not defined WORKER_NAME set "WORKER_NAME=%COMPUTERNAME%"
 echo LocalAI worker '%WORKER_NAME%' (%WORKER_IP%) -^> host %LOCALAI_SERVER%. Ctrl+C stops it.
 docker compose -p localai-worker --env-file "%ENV_FILE%" -f "%ROOT%docker\worker\docker-compose.yml" up --build
 exit /b %ERRORLEVEL%
+
+rem ---------------------------------------------------------------- model-capacity / model-list-all
+rem Both ask the host's API, so they work on any PC with the .env. CAP_PS holds the shared
+rem PowerShell: Cap $model -> slots per PC ("parallel:N" in the effective config, else 1),
+rem PCs with the model loaded, and requests running on them now.
+:model_capacity
+call :cap_init || exit /b 1
+set "CAP_MODEL=%~2"
+if not defined CAP_MODEL set "CAP_MODEL=%LOCALAI_MODEL%"
+powershell -NoProfile -Command "%CAP_PS% $m='%CAP_MODEL%'; $r = Cap $m; [Console]::Error.WriteLine(\"model ${m}: $($r.Slots) slots/PC x $($r.Replicas) PCs loaded, $($r.InFlight) requests running\"); Write-Output ($r.Slots * $r.Replicas)"
+exit /b %ERRORLEVEL%
+
+:model_list_all
+call :cap_init || exit /b 1
+powershell -NoProfile -Command "%CAP_PS% try { $ms = (Invoke-RestMethod -TimeoutSec 10 -Headers $h ($u+'/v1/models')).data } catch { Fail \"cannot read the models from $u\" }; foreach ($x in $ms) { $r = Cap $x.id; Write-Output ($x.id + \"`t\" + ($r.Slots * $r.Replicas)) }"
+exit /b %ERRORLEVEL%
+
+:cap_init
+if exist "%ENV_FILE%" goto :cap_env_ok
+echo Error: missing "%ENV_FILE%" 1>&2
+exit /b 1
+:cap_env_ok
+call :load_env
+set "CAP_PS=$u='http://%LOCALAI_SERVER%:%LOCALAI_PORT%'; $h=@{Authorization='Bearer %LOCALAI_API_KEY%'}; function Fail($t) { [Console]::Error.WriteLine('Error: ' + $t); exit 1 }; function Cap($m) { try { $c = Invoke-RestMethod -TimeoutSec 10 -Headers $h ($u+'/api/models/config-json/'+$m) } catch { Fail ('cannot read the config of ' + $m + ' from ' + $u) }; try { $n = Invoke-RestMethod -TimeoutSec 10 -Headers $h ($u+'/api/nodes/models') } catch { Fail ('cannot read the loaded models from ' + $u) }; $s = 1; foreach ($o in @($c.options)) { if ($o -match '^(n_)?parallel:(\d+)$') { $s = [int]$Matches[2]; break } }; $l = @($n | Where-Object { $_.model_name -eq $m -and $_.state -eq 'loaded' }); $f = ($l | Measure-Object -Property in_flight -Sum).Sum; if (-not $f) { $f = 0 }; [pscustomobject]@{ Slots = $s; Replicas = $l.Count; InFlight = $f } };"
+exit /b 0
 
 rem ---------------------------------------------------------------- helpers
 :check_docker
@@ -102,8 +135,9 @@ call :secret PGPASS
     echo LOCALAI_ADMIN_EMAIL=admin@localai
     echo LOCALAI_ADMIN_PASSWORD=admin123456
     echo.
-    echo # Model loaded on every PC, and parallel requests per PC.
-    echo LOCALAI_MODEL=gemma-4-12b-it-Q4_K_M
+    echo # Model loaded on every PC. Parallel requests per PC are picked by LocalAI from the
+    echo # GPU's VRAM; LLAMACPP_PARALLEL is used only when it picks none.
+    echo LOCALAI_MODEL=gemma-4-12b-it-qat-q4_0
     echo LLAMACPP_PARALLEL=5
     echo.
     echo # Used by the host only.

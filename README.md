@@ -3,8 +3,8 @@
 Several PCs with NVIDIA GPUs on one network serve LocalAI together. One PC is
 the **host**: it runs the API and web UI and uses its own GPU. The other PCs are
 **workers**: they join the host, get the model from it and take part of the
-requests. Each PC serves `LLAMACPP_PARALLEL` requests at once (5 by default), so
-every PC added raises the total.
+requests. Each PC serves several requests at once (LocalAI picks how many from
+the GPU's VRAM; see Capacity), so every PC added raises the total.
 
 ```
 localai-cluster.sh / .bat   host | worker
@@ -69,6 +69,25 @@ This PC's IP and name are detected (override with `WORKER_IP` / `WORKER_NAME` in
 `.env`). The first run downloads the LocalAI image (~10 GB), then the CUDA backend
 (~3 GB) and the model from the host (~7 GB over Wi-Fi). They stay on the PC, so
 later runs are quick.
+
+## Capacity
+
+```
+./localai-cluster.sh model-capacity [model]   (Windows: localai-cluster.bat model-capacity [model])
+./localai-cluster.sh model-list-all           (Windows: localai-cluster.bat model-list-all)
+```
+
+`model-capacity` prints how many requests the cluster serves at once for a model
+(`LOCALAI_MODEL` by default): the request slots per PC (LocalAI picks them from the
+GPU's VRAM) times the PCs that have the model loaded. Only the number goes to stdout,
+so scripts can cap their concurrency with it, e.g. `N=$(./localai-cluster.sh model-capacity)`.
+A summary line with the requests running right now goes to stderr.
+
+`model-list-all` lists every model on the host, one `<model><TAB><capacity>` per line.
+A model that is installed but not loaded on any PC shows 0.
+
+Both work on any PC that has the `.env`. The numbers change when PCs join or leave,
+so check them again from time to time.
 
 ## Security notes
 

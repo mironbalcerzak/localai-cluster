@@ -49,9 +49,10 @@ Give every PC a fixed IP (DHCP reservation in the router).
 
 The first run creates `.env` next to the script: the host's IP, a join token,
 the API key, the model (`LOCALAI_MODEL`, gemma-4-12b by default) and the
-database password. Then open `http://<host-ip>:23422` and sign up; the first
-account becomes admin, later sign-ups wait for approval. API clients send
-`Authorization: Bearer <LOCALAI_API_KEY>`.
+database password and the web UI login. Once the web UI answers, the host
+creates that login as admin: `admin@localai` / `admin123456` by default
+(`LOCALAI_ADMIN_EMAIL` / `LOCALAI_ADMIN_PASSWORD`; the script prints it). Other
+sign-ups wait for approval. API clients send `Authorization: Bearer <LOCALAI_API_KEY>`.
 
 The model named in `LOCALAI_MODEL` must be installed on the host (web UI, Models);
 the host then loads it on every PC.
@@ -71,6 +72,7 @@ later runs are quick.
 
 ## Security notes
 
-- `.env` holds the join token, API key and database password: share it only with your own PCs.
+- `.env` holds the join token, API key, admin login and database password: share it only with your own PCs.
+- `admin123456` is a weak default: change it in the web UI, or in `.env` before the first start.
 - The message bus (NATS, port 4222) has no password: anyone on the network could
   send it commands. Fine on a home network, not on a shared one.

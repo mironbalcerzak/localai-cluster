@@ -24,7 +24,9 @@ call :create_env || exit /b 1
 call :load_env
 set "LOCALAI_LOCAL_NODE_NAME=%COMPUTERNAME%"
 echo LocalAI host: http://127.0.0.1:%LOCALAI_PORT%  - LAN: http://%LOCALAI_SERVER%:%LOCALAI_PORT%
+echo Login: %LOCALAI_ADMIN_EMAIL% / %LOCALAI_ADMIN_PASSWORD%
 echo API key: %LOCALAI_API_KEY%   Ctrl+C stops it.
+if defined LOCALAI_ADMIN_PASSWORD call :create_admin
 docker compose -p localai --env-file "%ENV_FILE%" -f "%ROOT%docker\host\docker-compose.yml" up
 exit /b %ERRORLEVEL%
 
@@ -54,6 +56,11 @@ rem ---------------------------------------------------------------- helpers
 :check_docker
 where docker >nul 2>&1 || (echo Error: Docker Desktop is not installed& exit /b 1)
 docker info >nul 2>&1 || (echo Error: Docker Desktop is not running: start it and try again& exit /b 1)
+exit /b 0
+
+rem Once the web UI answers, create the admin account from .env if nobody signed up yet (in the background).
+:create_admin
+start "" /b powershell -NoProfile -Command "$u='http://127.0.0.1:%LOCALAI_PORT%'; for ($i=0; $i -lt 300; $i++) { try { Invoke-WebRequest -UseBasicParsing ($u+'/readyz') -TimeoutSec 5 | Out-Null; break } catch { Start-Sleep 2 } }; try { $s = Invoke-RestMethod ($u+'/api/auth/status') } catch { exit }; if (-not $s.hasUsers) { $b = @{ email='%LOCALAI_ADMIN_EMAIL%'; password='%LOCALAI_ADMIN_PASSWORD%'; name='admin'; acknowledge_weak_password=$true } | ConvertTo-Json; try { Invoke-RestMethod -Method Post -ContentType 'application/json' -Body $b ($u+'/api/auth/register') | Out-Null } catch { } }" >nul 2>&1
 exit /b 0
 
 rem Set every KEY=value of .env as a variable (lines starting with # are skipped).
@@ -91,6 +98,9 @@ call :secret PGPASS
     echo LOCALAI_REGISTRATION_TOKEN=%TOKEN%
     echo # Key for API clients, sent as a Bearer token.
     echo LOCALAI_API_KEY=sk-%APIKEY%
+    echo # Web UI login, created as admin on the host's first start. Must be an email address.
+    echo LOCALAI_ADMIN_EMAIL=admin@localai
+    echo LOCALAI_ADMIN_PASSWORD=admin123456
     echo.
     echo # Model loaded on every PC, and parallel requests per PC.
     echo LOCALAI_MODEL=gemma-4-12b-it-Q4_K_M

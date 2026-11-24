@@ -19,6 +19,22 @@ env_get() {
 # Source IP of this PC on the route towards $1.
 ip_towards() { ip -4 route get "$1" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1; }
 
+# Once the web UI answers: create the admin account from .env if nobody signed up yet.
+create_admin() {
+    local url email password
+    url="http://127.0.0.1:$(env_get LOCALAI_PORT)"
+    email="$(env_get LOCALAI_ADMIN_EMAIL)"; password="$(env_get LOCALAI_ADMIN_PASSWORD)"
+    [[ -n "$email" && -n "$password" ]] || return 0
+    for _ in $(seq 1 300); do
+        curl -sf -o /dev/null "${url}/readyz" && break
+        sleep 2
+    done
+    curl -sf "${url}/api/auth/status" | grep -q '"hasUsers":false' || return 0
+    curl -s -o /dev/null -H 'Content-Type: application/json' \
+        -d "{\"email\":\"${email}\",\"password\":\"${password}\",\"name\":\"admin\",\"acknowledge_weak_password\":true}" \
+        "${url}/api/auth/register"
+}
+
 check_docker() {
     command -v docker >/dev/null || die "Docker is not installed"
     docker info >/dev/null 2>&1 || die "Docker is not running, or this user may not use it (add yourself to the docker group)"
@@ -41,6 +57,9 @@ LOCALAI_PORT=23422
 LOCALAI_REGISTRATION_TOKEN=$(openssl rand -hex 24)
 # Key for API clients: Authorization: Bearer <key>
 LOCALAI_API_KEY=sk-$(openssl rand -hex 24)
+# Web UI login, created as admin on the host's first start. Must be an email address.
+LOCALAI_ADMIN_EMAIL=admin@localai
+LOCALAI_ADMIN_PASSWORD=admin123456
 
 # Model loaded on every PC, and parallel requests per PC.
 LOCALAI_MODEL=gemma-4-12b-it-Q4_K_M
@@ -64,7 +83,9 @@ case "${1:-}" in
         [[ -f "$ENV_FILE" ]] || create_env
         export LOCALAI_LOCAL_NODE_NAME="$(hostname)"
         echo "LocalAI host: http://127.0.0.1:$(env_get LOCALAI_PORT)  (LAN: http://$(env_get LOCALAI_SERVER):$(env_get LOCALAI_PORT))"
+        echo "Login: $(env_get LOCALAI_ADMIN_EMAIL) / $(env_get LOCALAI_ADMIN_PASSWORD)"
         echo "API key: $(env_get LOCALAI_API_KEY)   Ctrl+C stops it."
+        create_admin >/dev/null 2>&1 &
         exec docker compose -p localai --env-file "$ENV_FILE" -f "${ROOT}/docker/host/docker-compose.yml" up
         ;;
     worker)

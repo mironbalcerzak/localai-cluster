@@ -1,0 +1,2 @@
+# Holds the server join token: never commit. Created by `localai worker-kit` on the server.
+.env

@@ -1,0 +1,39 @@
+# LocalAI cluster worker. Normally started by ../localai-worker.sh or ../localai-worker.bat.
+# Settings come from .env in this directory (template: ../.env.example).
+name: localai-worker
+
+services:
+  worker:
+    build: .
+    image: localai-worker:latest
+    container_name: localai-worker
+    restart: unless-stopped
+    init: true
+    environment:
+      LOCALAI_SERVER: "${LOCALAI_SERVER:?set LOCALAI_SERVER in docker/.env}"
+      LOCALAI_SERVER_PORT: "${LOCALAI_SERVER_PORT:-23422}"
+      LOCALAI_REGISTRATION_TOKEN: "${LOCALAI_REGISTRATION_TOKEN:?set LOCALAI_REGISTRATION_TOKEN in docker/.env}"
+      # The start scripts fill these in when they are empty in .env.
+      WORKER_IP: "${WORKER_IP:?start with localai-worker.sh / localai-worker.bat, or set WORKER_IP in docker/.env}"
+      WORKER_NAME: "${WORKER_NAME:-}"
+      LLAMACPP_PARALLEL: "${LLAMACPP_PARALLEL:-5}"
+    ports:
+      - "50050-50059:50050-50059"
+    volumes:
+      - models:/models       # copy of the models, sent by the server on first use
+      - backends:/backends   # llama.cpp CUDA backend, downloaded on first use
+      - staging:/staging
+      - cache:/cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, utility]
+
+volumes:
+  models:
+  backends:
+  staging:
+  cache:

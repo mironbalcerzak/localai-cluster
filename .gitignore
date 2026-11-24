@@ -1,2 +1,3 @@
-# Holds the server join token: never commit. Created by `localai worker-kit` on the server.
+# Configured worker settings with the join token: never commit.
+docker/.env
 .env

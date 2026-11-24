@@ -1,50 +1,54 @@
-# LocalAI worker – setup on another PC
+# LocalAI worker
 
-This repo turns a PC with an NVIDIA GPU into a worker of the LocalAI server.
-The server sends it the model and routes part of the requests to it.
+Turns a PC with an NVIDIA GPU into a worker of the LocalAI server. The server
+sends it the model (gemma-4-12b by default) and routes part of the requests to it,
+so every PC added raises the number of requests served in parallel.
 
-## 1. Install prerequisites (once)
+```
+localai-worker.bat / .sh   start, stop, logs, status, update
+localai-worker.ps1         the Windows logic behind the .bat
+.env.example               template of the settings
+docker/                    Dockerfile, compose file, entrypoint; docker/.env goes here
+```
+
+## 1. Prerequisites (once per PC)
 
 **Windows**
 1. Up-to-date NVIDIA driver.
-2. Docker Desktop with the WSL 2 backend (the default). GPU support works out of the box.
-3. Check in PowerShell: `docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi`
-4. Allow the server to reach the worker ports (PowerShell as Administrator):
+2. [Docker Desktop](https://www.docker.com/products/docker-desktop/) with the WSL 2 backend (the default).
+3. Let the server reach the worker ports. In PowerShell as Administrator:
    ```powershell
    New-NetFirewallRule -DisplayName "LocalAI worker" -Direction Inbound -Protocol TCP -LocalPort 50050-50059 -Action Allow -Profile Private,Domain
    ```
-   Make sure the Wi-Fi network is set to **Private** in Windows settings.
+   The Wi-Fi network must be set to **Private** in Windows settings.
 
 **Linux**
-1. NVIDIA driver, Docker Engine, NVIDIA Container Toolkit
+1. NVIDIA driver, Docker Engine with the compose plugin, NVIDIA Container Toolkit
    (`sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker`).
-2. Check: `docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi`
-3. If ufw is on: `sudo ufw allow from <server-ip> to any port 50050:50059 proto tcp`
+2. If ufw is on: `sudo ufw allow from <server-ip> to any port 50050:50059 proto tcp`
 
-## 2. Configure
+Check GPU access in Docker on either system:
+`docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi`
 
-Get the files onto the PC: copy this folder, or `git clone` it. The `.env` file holds
-the server address and join token and is not in git. Get it from the server PC:
-running `localai worker-kit` there writes it into this folder, and you copy it along.
-Without it, copy `.env.example` to `.env` and fill in the server values.
+## 2. Settings
 
-In `.env`, set `WORKER_IP` to this PC's Wi-Fi IP
-(Windows: `ipconfig`, Linux: `hostname -I`). Optionally set `WORKER_NAME`.
-Best: give every PC a fixed IP (DHCP reservation in the router).
+Put the configured `.env` you received into the `docker/` directory (`docker/.env`).
+It holds the server address and join token, so it is not in git.
+(On the server, `localai worker-kit` creates it. By hand: copy `.env.example`.)
 
-## 3. Start
+This PC's IP and name are detected automatically. Set `WORKER_IP` / `WORKER_NAME`
+in `docker/.env` only to override them. Best: give every PC a fixed IP (DHCP
+reservation in the router).
 
-In this folder:
+## 3. Run
 
-```
-docker compose up -d --build
-docker compose logs -f
-```
+- **Windows:** double-click `localai-worker.bat`
+- **Linux:** `./localai-worker.sh`
 
-You should see `Registered with frontend` and `Worker ready`. The worker then shows
-up in the server's web UI (Nodes). The first request it serves is slow: it downloads
-the CUDA backend (~3 GB) and receives the model from the server (~7 GB over Wi-Fi).
-After that, both stay on this PC.
+The script builds the image, starts the worker, waits until it is registered with
+the server and sends one test request for the model. The first start downloads the
+LocalAI image (~10 GB), then the CUDA backend (~3 GB) and the model from the server
+(~7 GB over Wi-Fi). These stay on the PC, so later starts are quick.
 
-It restarts with Docker automatically. Stop: `docker compose down`.
-Update: `docker compose build --pull && docker compose up -d`.
+The worker restarts with Docker automatically. Other commands:
+`stop`, `logs`, `status`, `update` (e.g. `localai-worker.bat logs`).

@@ -1,8 +1,8 @@
 # LocalAI host (Windows, Docker Desktop): the server of the cluster. Run via localai-host.bat.
 #
-#   localai-host.bat [start]     start (default); creates docker\host\.env on first run
+#   localai-host.bat [start]     start (default); creates .env next to this script on first run
 #   localai-host.bat stop | update | status | logs [service]
-#   localai-host.bat worker-env  write docker\worker\.env to hand out to worker PCs
+#   localai-host.bat worker-env  write worker.env to hand out to worker PCs
 #   localai-host.bat nodes       list the workers
 #   localai-host.bat api-key     print the API key for clients
 param([string]$Command = "start", [Parameter(ValueFromRemainingArguments = $true)][string[]]$Rest)
@@ -10,8 +10,8 @@ param([string]$Command = "start", [Parameter(ValueFromRemainingArguments = $true
 $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
 $ComposeFile = Join-Path $Root "docker\host\docker-compose.yml"
-$EnvFile = Join-Path $Root "docker\host\.env"
-$WorkerEnv = Join-Path $Root "docker\worker\.env"
+$EnvFile = Join-Path $Root ".env"
+$WorkerEnv = Join-Path $Root "worker.env"
 $Scheduling = Join-Path $Root "docker\host\scheduling.yaml"
 $DefaultPort = "23422"
 
@@ -47,7 +47,7 @@ function Get-LanIp {
 function Get-Port { $p = (Read-EnvFile)["LOCALAI_PORT"]; if ($p) { $p } else { $DefaultPort } }
 function Get-Url { "http://127.0.0.1:$(Get-Port)" }
 
-function Invoke-Compose { & docker compose -f $ComposeFile @args; if ($LASTEXITCODE -ne 0) { Fail "docker compose $args failed" } }
+function Invoke-Compose { & docker compose --env-file $EnvFile -f $ComposeFile @args; if ($LASTEXITCODE -ne 0) { Fail "docker compose $args failed" } }
 
 function Test-Docker {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { Fail "Docker Desktop is not installed (see README.md)" }
@@ -57,8 +57,15 @@ function Test-Docker {
 
 # Settings and secrets, created once.
 function Initialize-Env {
-    if (Test-Path $EnvFile) { return }
+    if (Test-Path $EnvFile) {
+        if (-not (Read-EnvFile)["POSTGRES_PASSWORD"]) {
+            Fail "$EnvFile holds worker settings, not host settings (this PC is a worker: use localai-worker.bat)"
+        }
+        return
+    }
     Write-PlainFile $EnvFile @(
+        "# LocalAI host settings, created on the first start. Keep it private: it holds the",
+        "# secrets of this cluster. Changes take effect on the next start.",
         "COMPOSE_PROJECT_NAME=localai",
         "LOCALAI_PORT=$DefaultPort",
         "# 0.0.0.0 = reachable from the LAN (workers register here). The web UI needs a login.",
@@ -71,7 +78,7 @@ function Initialize-Env {
         "LLAMACPP_PARALLEL=5",
         "LOCALAI_LOCAL_NODE_NAME=$env:COMPUTERNAME"
     )
-    Write-Host "Created $EnvFile"
+    Write-Host "Created $EnvFile (settings and secrets of this host)"
 }
 
 function Wait-Ready {
@@ -93,7 +100,8 @@ function Write-WorkerEnv {
     $model = (Select-String -Path $Scheduling -Pattern '^- model_name:\s*(\S+)' | Select-Object -First 1).Matches.Groups[1].Value
     if (-not $model) { $model = "gemma-4-12b-it-Q4_K_M" }
     Write-PlainFile $WorkerEnv @(
-        "# Created by 'localai-host.bat worker-env'. Same file for every worker PC.",
+        "# Worker settings, created by 'localai-host.bat worker-env' on the host.",
+        "# On each worker PC save this file as .env next to localai-worker.sh / .bat.",
         "",
         "# --- LocalAI server ---",
         "LOCALAI_SERVER=$ip",
@@ -114,7 +122,7 @@ function Write-WorkerEnv {
     )
     Write-Host "Written: $WorkerEnv  (holds the join token and API key)"
     Write-Host "Server address in it: $ip. Give this PC a fixed IP in the router, or rerun this when it changes."
-    Write-Host "On each worker PC: check out this repo, put the file at docker\worker\.env, run localai-worker.bat / .sh"
+    Write-Host "On each worker PC: check out this repo, save the file as .env next to the scripts, run localai-worker.bat / .sh"
 }
 
 function Assert-Env { if (-not (Test-Path $EnvFile)) { Fail "start the host once first" } }
@@ -131,7 +139,7 @@ switch ($Command) {
     "update" { Test-Docker; Initialize-Env; Invoke-Compose pull; Invoke-Compose up -d; Wait-Ready }
     "stop" { Test-Docker; Invoke-Compose down }
     "status" { Test-Docker; Invoke-Compose ps }
-    "logs" { Test-Docker; & docker compose -f $ComposeFile logs -f --tail 100 @Rest }
+    "logs" { Test-Docker; & docker compose --env-file $EnvFile -f $ComposeFile logs -f --tail 100 @Rest }
     "worker-env" { Assert-Env; Write-WorkerEnv }
     "api-key" { Assert-Env; (Read-EnvFile)["LOCALAI_API_KEY"] }
     "nodes" {

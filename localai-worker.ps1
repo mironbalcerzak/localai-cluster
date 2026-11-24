@@ -3,18 +3,19 @@
 #   localai-worker.bat [start]   build, start and test (default)
 #   localai-worker.bat stop | logs | status | update
 #
-# Needs docker\worker\.env (copy of .env.example with the server values filled in).
+# Needs .env next to this script: the worker.env created on the host
+# (or a copy of .env.example with the server values filled in).
 param([string]$Command = "start")
 
 $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
 $ComposeFile = Join-Path $Root "docker\worker\docker-compose.yml"
-$EnvFile = Join-Path $Root "docker\worker\.env"
+$EnvFile = Join-Path $Root ".env"
 $Container = "localai-worker"
 
 function Fail($msg) { Write-Host "Error: $msg" -ForegroundColor Red; exit 1 }
 
-# KEY=value pairs from docker\worker\.env (comments, quotes and spaces stripped).
+# KEY=value pairs from .env (comments, quotes and spaces stripped).
 function Read-EnvFile {
     $values = @{}
     foreach ($line in Get-Content $EnvFile) {
@@ -26,16 +27,20 @@ function Read-EnvFile {
     return $values
 }
 
-function Invoke-Compose { & docker compose -f $ComposeFile @args; if ($LASTEXITCODE -ne 0) { Fail "docker compose $args failed" } }
+function Invoke-Compose { & docker compose --env-file $EnvFile -f $ComposeFile @args; if ($LASTEXITCODE -ne 0) { Fail "docker compose $args failed" } }
 
 function Test-Prereqs {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { Fail "Docker Desktop is not installed (see README.md)" }
     & docker info *> $null
     if ($LASTEXITCODE -ne 0) { Fail "Docker Desktop is not running: start it and try again" }
-    if (-not (Test-Path $EnvFile)) { Fail "missing $EnvFile : put the configured .env there (template: .env.example)" }
+    if (-not (Test-Path $EnvFile)) {
+        Copy-Item (Join-Path $Root ".env.example") $EnvFile
+        Fail "created $EnvFile from .env.example. Replace it with the worker.env from the host (or fill in LOCALAI_SERVER and LOCALAI_REGISTRATION_TOKEN), then run this again."
+    }
     $cfg = Read-EnvFile
-    if (-not $cfg["LOCALAI_SERVER"]) { Fail "LOCALAI_SERVER is empty in docker\worker\.env" }
-    if (-not $cfg["LOCALAI_REGISTRATION_TOKEN"]) { Fail "LOCALAI_REGISTRATION_TOKEN is empty in docker\worker\.env" }
+    if ($cfg["POSTGRES_PASSWORD"]) { Fail "$EnvFile holds host settings (this PC is the host: use localai-host.bat)" }
+    if (-not $cfg["LOCALAI_SERVER"]) { Fail "LOCALAI_SERVER is empty in $EnvFile" }
+    if (-not $cfg["LOCALAI_REGISTRATION_TOKEN"]) { Fail "LOCALAI_REGISTRATION_TOKEN is empty in $EnvFile" }
     return $cfg
 }
 
@@ -47,7 +52,7 @@ function Set-Identity($cfg) {
             $ip = (Find-NetRoute -RemoteIPAddress $cfg["LOCALAI_SERVER"] |
                 Where-Object { $_.IPAddress } | Select-Object -First 1).IPAddress
         } catch { $ip = $null }
-        if (-not $ip) { Fail "cannot detect this PC's IP towards $($cfg["LOCALAI_SERVER"]); set WORKER_IP in docker\worker\.env" }
+        if (-not $ip) { Fail "cannot detect this PC's IP towards $($cfg["LOCALAI_SERVER"]); set WORKER_IP in $EnvFile" }
     }
     $name = $cfg["WORKER_NAME"]
     if (-not $name) { $name = $env:COMPUTERNAME }
@@ -77,7 +82,7 @@ function Wait-Registered($cfg) {
 function Test-Request($cfg) {
     $key = $cfg["LOCALAI_API_KEY"]; $model = $cfg["LOCALAI_MODEL"]
     if (-not $key -or -not $model) {
-        Write-Host "Skipping the test request (LOCALAI_API_KEY or LOCALAI_MODEL empty in docker\worker\.env)."
+        Write-Host "Skipping the test request (LOCALAI_API_KEY or LOCALAI_MODEL empty in .env)."
         return
     }
     $url = "$(Get-ServerUrl $cfg)/v1/chat/completions"

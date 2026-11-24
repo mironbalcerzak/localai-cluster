@@ -6,13 +6,13 @@
 #   nats          message bus; remote workers connect to :4222.
 #
 # Other PCs join with ../../localai-worker.sh / .bat.
-# Settings and secrets live in .env next to this file (created by the host script).
+# Settings and secrets live in the .env next to the start scripts (created on the first start).
 
 name: ${COMPOSE_PROJECT_NAME:-localai}
 
 x-common-env: &common-env
   LOCALAI_NATS_URL: "nats://nats:4222"
-  LOCALAI_REGISTRATION_TOKEN: "${LOCALAI_REGISTRATION_TOKEN:?start with localai-host.sh / localai-host.bat to create docker/host/.env}"
+  LOCALAI_REGISTRATION_TOKEN: "${LOCALAI_REGISTRATION_TOKEN:?start with localai-host.sh / localai-host.bat, which creates .env}"
   GODEBUG: "netdns=go"
 
 services:

@@ -2,17 +2,17 @@
 # LocalAI host (Linux): the server of the cluster. Runs the API + web UI, Postgres,
 # NATS and a worker on this PC's GPU. Other PCs join with localai-worker.sh / .bat.
 #
-#   ./localai-host.sh [start]     start (default); creates docker/host/.env on first run
+#   ./localai-host.sh [start]     start (default); creates .env next to this script on first run
 #   ./localai-host.sh stop | update | status | logs [service]
-#   ./localai-host.sh worker-env  write docker/worker/.env to hand out to worker PCs
+#   ./localai-host.sh worker-env  write worker.env to hand out to worker PCs
 #   ./localai-host.sh nodes       list the workers
 #   ./localai-host.sh api-key     print the API key for clients
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 COMPOSE_FILE="${ROOT}/docker/host/docker-compose.yml"
-ENV_FILE="${ROOT}/docker/host/.env"
-WORKER_ENV="${ROOT}/docker/worker/.env"
+ENV_FILE="${ROOT}/.env"
+WORKER_ENV="${ROOT}/worker.env"
 DEFAULT_PORT=23422
 
 die() { echo "Error: $*" >&2; exit 1; }
@@ -25,7 +25,7 @@ env_get() {
 port() { local p; p="$(env_get LOCALAI_PORT)"; echo "${p:-$DEFAULT_PORT}"; }
 url() { echo "http://127.0.0.1:$(port)"; }
 lan_ip() { ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1; }
-compose() { docker compose -f "$COMPOSE_FILE" "$@"; }
+compose() { docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
 
 check_docker() {
     command -v docker >/dev/null || die "Docker is not installed (see README.md)"
@@ -35,11 +35,17 @@ check_docker() {
 
 # Settings and secrets, created once.
 ensure_env() {
-    [[ -f "$ENV_FILE" ]] && return 0
+    if [[ -f "$ENV_FILE" ]]; then
+        [[ -n "$(env_get POSTGRES_PASSWORD)" ]] \
+            || die "${ENV_FILE} holds worker settings, not host settings (this PC is a worker: use localai-worker.sh)"
+        return 0
+    fi
     command -v openssl >/dev/null || die "openssl is needed to create the secrets"
     (
         umask 077
         cat > "$ENV_FILE" <<EOF
+# LocalAI host settings, created on the first start. Keep it private: it holds the
+# secrets of this cluster. Changes take effect on the next start.
 COMPOSE_PROJECT_NAME=localai
 LOCALAI_PORT=${DEFAULT_PORT}
 # 0.0.0.0 = reachable from the LAN (workers register here). The web UI needs a login.
@@ -53,7 +59,7 @@ LLAMACPP_PARALLEL=5
 LOCALAI_LOCAL_NODE_NAME=$(hostname)
 EOF
     )
-    echo "Created ${ENV_FILE}"
+    echo "Created ${ENV_FILE} (settings and secrets of this host)"
 }
 
 wait_ready() {
@@ -75,7 +81,8 @@ worker_env() {
     (
         umask 077
         cat > "$WORKER_ENV" <<EOF
-# Created by 'localai-host.sh worker-env'. Same file for every worker PC.
+# Worker settings, created by 'localai-host.sh worker-env' on the host.
+# On each worker PC save this file as .env next to localai-worker.sh / .bat.
 
 # --- LocalAI server ---
 LOCALAI_SERVER=${ip}
@@ -95,9 +102,9 @@ WORKER_IP=
 WORKER_NAME=
 EOF
     )
-    echo "Written: ${WORKER_ENV}  (gitignored: holds the join token and API key)"
+    echo "Written: ${WORKER_ENV}  (holds the join token and API key)"
     echo "Server address in it: ${ip}. Give this PC a fixed IP in the router, or rerun this when it changes."
-    echo "On each worker PC: check out this repo, put the file at docker/worker/.env, run localai-worker.bat / .sh"
+    echo "On each worker PC: check out this repo, save the file as .env next to the scripts, run localai-worker.bat / .sh"
 }
 
 case "${1:-start}" in

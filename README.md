@@ -10,9 +10,12 @@ requests at once (5 by default), so every PC added raises the total.
 localai-host.sh / .bat     run the host
 localai-worker.sh / .bat   run a worker
 *.ps1                      the Windows logic behind the .bat files
+.env                       settings of this PC (host: created on first start,
+                           worker: the worker.env from the host)
+worker.env                 on the host: the settings to hand out to workers
 .env.example               template of the worker settings
-docker/host/               host compose file, scheduling.yaml, .env (generated)
-docker/worker/             worker Dockerfile, compose file, .env (from the host)
+docker/host/               host compose file, scheduling.yaml
+docker/worker/             worker Dockerfile and compose file
 ```
 
 The `.bat` files can be double-clicked. Every script takes a command:
@@ -46,23 +49,26 @@ Give every PC a fixed IP (DHCP reservation in the router).
 ## Host
 
 1. Run `localai-host.bat` (Windows) or `./localai-host.sh` (Linux). The first
-   start creates `docker/host/.env` with fresh secrets.
+   start creates `.env` next to the script, with the settings and fresh secrets
+   of this host (port, parallel requests, API key, ...).
 2. Open `http://<host-ip>:23422` and sign up. The first account becomes admin;
    later sign-ups wait for approval.
 3. The model must exist on the host: on a fresh host, install
    `gemma-4-12b-it-Q4_K_M` in the web UI, or change `docker/host/scheduling.yaml`
    to the model you use. That file decides which models every worker loads.
 4. Create the worker settings: `localai-host.bat worker-env` / `./localai-host.sh worker-env`.
-   This writes `docker/worker/.env` with the host address, join token and API key.
+   This writes `worker.env` next to the script, with the host address, join token
+   and API key.
 
 Extras: `nodes` lists the workers, `api-key` prints the key for API clients
 (`Authorization: Bearer <key>`), `logs frontend` shows the logs of one service.
 
 ## Worker
 
-1. Check out this repo and put the `docker/worker/.env` created on the host into
-   `docker/worker/`. This PC's IP and name are detected automatically; set
-   `WORKER_IP` / `WORKER_NAME` there only to override them.
+1. Check out this repo and save the `worker.env` from the host as `.env` next to
+   the scripts. (Without it, the first start creates `.env` from `.env.example`
+   and stops, so you can fill it in.) This PC's IP and name are detected
+   automatically; set `WORKER_IP` / `WORKER_NAME` in `.env` only to override them.
 2. Run `localai-worker.bat` (Windows) or `./localai-worker.sh` (Linux).
 
 The script builds the image, starts the worker, waits until it is registered and
@@ -73,6 +79,6 @@ with Docker automatically.
 
 ## Security notes
 
-- `docker/*/.env` hold the join token, API key and database password; they are gitignored.
+- `.env` and `worker.env` hold the join token, API key and database password; they are gitignored.
 - The message bus (NATS, port 4222) has no password: anyone on the network could
   send it commands. Fine on a home network, not on a shared one.

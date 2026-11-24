@@ -16,5 +16,16 @@ export LOCALAI_ADVERTISE_ADDR="${WORKER_IP}:50051"
 export LOCALAI_ADVERTISE_HTTP_ADDR="${WORKER_IP}:50050"
 export LOCALAI_NODE_NAME="${WORKER_NAME:-worker-${WORKER_IP//./-}}"
 
+# Windows (Docker Desktop, WSL 2) puts the NVIDIA driver library libcuda.so.1 in
+# /usr/lib/wsl/lib, not in /usr/lib/x86_64-linux-gnu as on Linux. LocalAI's llama.cpp
+# backend starts with its own loader (lib/ld.so) and only looks in its own folder plus
+# LD_LIBRARY_PATH, so without this it finds no CUDA and silently runs on the CPU.
+if [[ -e /usr/lib/wsl/lib/libcuda.so.1 ]]; then
+    export LD_LIBRARY_PATH="/usr/lib/wsl/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    echo "localai-worker: Windows GPU driver found in /usr/lib/wsl/lib"
+elif [[ -d /usr/lib/wsl ]]; then
+    echo "localai-worker: WARNING: WSL 2 but no libcuda.so.1 in /usr/lib/wsl/lib: models will run on the CPU (update the NVIDIA driver and Docker Desktop)" >&2
+fi
+
 echo "localai-worker: node ${LOCALAI_NODE_NAME} (${WORKER_IP}) -> server ${LOCALAI_REGISTER_TO}"
 exec /entrypoint.sh worker "$@"

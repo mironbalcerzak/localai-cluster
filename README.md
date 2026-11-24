@@ -115,6 +115,13 @@ time, over the network, resumed after an interruption). So a model is already on
 PC when the host loads it here. Follow it with `docker logs -f localai-worker-sync`.
 The host's own GPU worker has the same service (`worker-sync`).
 
+On Windows (Docker Desktop with WSL 2) the NVIDIA driver's CUDA library sits in
+`/usr/lib/wsl/lib` inside the container, where LocalAI's llama.cpp backend does not look
+by itself: the model would load on the CPU while `nvidia-smi` shows the GPU just fine. The
+worker adds that folder to its library path at start; its log says
+`Windows GPU driver found in /usr/lib/wsl/lib`. `diagnose` shows whether a loaded model
+really sits on the GPU.
+
 ## Diagnose
 
 ```

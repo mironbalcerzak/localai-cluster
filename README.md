@@ -52,13 +52,21 @@ the API key, the model (`LOCALAI_MODEL`, gemma-4-12b by default) and the
 database password.
 
 **No login and no API key.** LocalAI's distributed mode needs authentication, so
-it stays on inside, but a small proxy on the host's port (Caddy, in
-`docker/host/docker-compose.yml`) adds `LOCALAI_API_KEY` to every request. Clients
-can send no key or any dummy key, and the web UI opens as an admin ("API Key User")
-without a login. Only the workers' own calls (`/api/node/*`) pass through unchanged,
-with their join token. The add-on pages do not work under that user. The host still
+it stays on inside, but a proxy on the host's port (nginx, in
+`docker/host/docker-compose.yml`) handles keys: a client's own key is checked first
+and passed on when LocalAI accepts it; no key, or a key LocalAI rejects (401), is
+replaced by `LOCALAI_API_KEY`. So tools that insist on sending a key work, and so
+do clients and the web UI without one (the UI opens as the admin "API Key User";
+the add-on pages do not work under that user). The workers' own calls
+(`/api/node/*`) pass through unchanged, with their join token. The host still
 creates an admin account (`LOCALAI_ADMIN_EMAIL` / `LOCALAI_ADMIN_PASSWORD`) on its
 first start.
+
+**Models load on demand.** No model is loaded while the cluster is idle. The first
+request for a model loads one copy (about a minute); more PCs get a copy only while
+all copies are busy. A model with no requests for `LOCALAI_IDLE_UNLOAD` (2 minutes by
+default) is unloaded everywhere by the host's `idle-unloader` container (LocalAI's
+own idle watchdog does not reach models on workers).
 
 The model named in `LOCALAI_MODEL` must be installed on the host; the host then
 loads it on every PC. The default is `unsloth/gemma-4-12B-it-qat-GGUF` from Hugging

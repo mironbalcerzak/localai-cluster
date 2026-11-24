@@ -1,2 +1,5 @@
+.idea
+*.iml
+
 # Cluster settings with tokens, keys and passwords: never commit.
 .env

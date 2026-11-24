@@ -74,6 +74,9 @@ LOCALAI_ADMIN_PASSWORD=admin123456
 # Model loaded on every PC. Parallel requests per PC are picked by LocalAI from the
 # GPU's VRAM; LLAMACPP_PARALLEL is used only when it picks none.
 LOCALAI_MODEL=gemma-4-12B-it-qat-UD-Q4_K_XL
+LOCALAI_EMBEDDING_MODEL=Qwen3-Embedding-8B-Q4_K_M.gguf
+# Models load on the first request and unload after this long without one.
+LOCALAI_IDLE_UNLOAD=2m
 LLAMACPP_PARALLEL=5
 
 # Used by the host only.

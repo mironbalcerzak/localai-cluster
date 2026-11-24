@@ -5,6 +5,10 @@
 #                         The first run creates .env next to this script.
 #   ./localai-cluster.sh worker   lend this PC's GPU to the host. Needs the host's .env
 #                         copied next to this script.
+#   ./localai-cluster.sh diagnose
+#                         check the connections this PC needs: as host (LocalAI, NATS, every
+#                         registered worker reachable from here) or as worker (host, token,
+#                         registration, containers, model sync). Read-only.
 #   ./localai-cluster.sh model-capacity [model]
 #                         print how many requests the cluster serves at once for a model
 #                         (slots per PC x PCs with it loaded; LOCALAI_MODEL by default).
@@ -113,6 +117,170 @@ else
     chat_request() { die "useChatCompletions needs jq or python3"; }
 fi
 
+# ---------------------------------------------------------------- diagnose
+# Checks the connections this PC needs, as host or as worker. Read-only: it sends no
+# inference requests and changes nothing. Returns 1 if a check failed.
+#   Host:   LocalAI answering here and on the LAN, NATS open, and every registered worker
+#           reachable from here on its file port (50050) and model port (50051).
+#   Worker: host reachable (API, NATS), join token accepted, this PC registered and
+#           healthy, worker and sync containers running.
+FAILED=0
+ok()   { printf '  \033[32mOK\033[0m    %s\n' "$*"; }
+warn() { printf '  \033[33mWARN\033[0m  %s\n' "$*"; }
+fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; FAILED=1; }
+info() { printf '        %s\n' "$*"; }
+section() { printf '\n%s\n' "$*"; }
+
+# tcp_open HOST PORT: can a TCP connection be made within 5 seconds?
+tcp_open() { timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
+
+# http_any URL: does anything answer HTTP there (any status code)?
+http_any() { local c; c="$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$1")"; [[ "$c" != 000 ]]; }
+
+# JSON on stdin -> tab-separated lines (jq, else python3).
+py_tsv() {
+    python3 -c '
+import json, sys
+mode, d = sys.argv[1], json.load(sys.stdin)
+rows = {
+    "nodes":  lambda: [[n.get(k) or "" for k in ("name", "status", "address", "http_address", "last_heartbeat")] for n in d],
+    "models": lambda: [[m["id"]] for m in d.get("data", [])],
+    "loaded": lambda: [[r["model_name"], r["state"]] for r in d],
+}[mode]()
+for r in rows: print("\t".join(str(x) for x in r))
+' "$1"
+}
+nodes_tsv()  { if command -v jq >/dev/null; then jq -r '.[] | [.name, .status, .address, .http_address, .last_heartbeat] | @tsv'; else py_tsv nodes; fi; }
+models_tsv() { if command -v jq >/dev/null; then jq -r '.data[].id'; else py_tsv models; fi; }
+loaded_tsv() { if command -v jq >/dev/null; then jq -r '.[] | [.model_name, .state] | @tsv'; else py_tsv loaded; fi; }
+
+container_state() { docker inspect -f '{{.State.Status}}{{if .State.Health}} ({{.State.Health.Status}}){{end}}' "$1" 2>/dev/null; }
+
+check_container() {
+    local st; st="$(container_state "$1")"
+    if [[ -z "$st" ]]; then fail "container $1 does not exist"
+    elif [[ "$st" == running* && "$st" != *unhealthy* ]]; then ok "container $1: $st"
+    else fail "container $1: $st"; fi
+}
+
+diagnose() {
+    # ---------------------------------------------------------------- basics
+    section "Basics"
+    [[ -f "$ENV_FILE" ]] || { fail "missing ${ENV_FILE}"; exit 1; }
+    ok ".env found: ${ENV_FILE}"
+    command -v curl >/dev/null || { fail "curl is not installed"; exit 1; }
+    command -v jq >/dev/null || command -v python3 >/dev/null || { fail "jq or python3 is needed"; exit 1; }
+    if ! command -v docker >/dev/null; then fail "Docker is not installed"
+    elif ! docker info >/dev/null 2>&1; then fail "Docker is not running, or this user may not use it"
+    else ok "Docker is running"; fi
+
+    SERVER="$(env_get LOCALAI_SERVER)"; PORT="$(env_get LOCALAI_PORT)"; PORT="${PORT:-23422}"
+    TOKEN="$(env_get LOCALAI_REGISTRATION_TOKEN)"
+    [[ -n "$SERVER" ]] || { fail "LOCALAI_SERVER is empty in .env"; exit 1; }
+    MY_IPS="$(ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | tr '\n' ' ')"
+    info "host in .env: ${SERVER}:${PORT}; this PC: $(hostname) (${MY_IPS% })"
+
+    if [[ " ${MY_IPS} " == *" ${SERVER} "* ]] || [[ -n "$(container_state localai-proxy-1)" ]]; then
+        ROLE=host
+    else
+        ROLE=worker
+    fi
+    info "role: ${ROLE}$( [[ $ROLE == host ]] && echo " (LOCALAI_SERVER is this PC, or the host stack runs here)" || echo " (LOCALAI_SERVER is another PC)")"
+
+    # ---------------------------------------------------------------- host
+    if [[ "$ROLE" == host ]]; then
+        section "Host containers"
+        for c in localai-proxy-1 localai-frontend-1 localai-worker-local-1 localai-worker-sync-1 localai-postgres-1 localai-nats-1; do
+            check_container "$c"
+        done
+
+        section "Host reachable"
+        if curl -sf -m 5 -o /dev/null "http://127.0.0.1:${PORT}/readyz"; then ok "LocalAI answers on http://127.0.0.1:${PORT}"
+        else fail "LocalAI does not answer on http://127.0.0.1:${PORT} (is the host started?)"; fi
+        if curl -sf -m 5 -o /dev/null "http://${SERVER}:${PORT}/readyz"; then ok "LocalAI answers on the LAN address http://${SERVER}:${PORT}"
+        else fail "LocalAI does not answer on http://${SERVER}:${PORT}: wrong LOCALAI_SERVER in .env, or LOCALAI_BIND"; fi
+        if tcp_open "$SERVER" 4222; then ok "NATS port ${SERVER}:4222 is open (workers connect to it)"
+        else fail "NATS port ${SERVER}:4222 is closed: workers cannot connect"; fi
+
+        section "Workers registered with this host"
+        nodes="$(curl -sf -m 10 "http://127.0.0.1:${PORT}/api/nodes" | nodes_tsv)"
+        if [[ -z "$nodes" ]]; then
+            warn "no workers registered"
+        else
+            while IFS=$'\t' read -r name status addr http_addr beat; do
+                [[ -n "$name" ]] || continue
+                if [[ "$status" == healthy ]]; then ok "${name}: ${status} (last heartbeat ${beat%.*})"
+                else fail "${name}: ${status} (last heartbeat ${beat%.*})"; fi
+                if [[ "$addr" == worker-local:* ]]; then
+                    info "this PC's own GPU worker, reached inside Docker"
+                    continue
+                fi
+                # The host connects back to every worker: file uploads and model loads (50050), inference (50051).
+                h="${http_addr%:*}"; hp="${http_addr##*:}"; a="${addr%:*}"; ap="${addr##*:}"
+                if http_any "http://${http_addr}/"; then ok "${name}: file port ${http_addr} reachable from this host"
+                else fail "${name}: file port ${http_addr} NOT reachable from this host: open TCP 50050-50059 in that PC's firewall (see README)"; fi
+                if tcp_open "$a" "$ap"; then ok "${name}: model port ${addr} reachable from this host"
+                else fail "${name}: model port ${addr} NOT reachable from this host: open TCP 50050-50059 in that PC's firewall (see README)"; fi
+            done <<<"$nodes"
+        fi
+
+        section "Models"
+        installed="$(curl -sf -m 10 "http://127.0.0.1:${PORT}/v1/models" | models_tsv)"
+        for want in "$(env_get LOCALAI_MODEL)" "$(env_get LOCALAI_EMBEDDING_MODEL)"; do
+            [[ -n "$want" ]] || continue
+            if grep -qxF "$want" <<<"$installed"; then ok "installed: ${want}"
+            else warn "not installed (yet): ${want}: the proxy installs it on start, see docker logs localai-proxy-1"; fi
+        done
+        loaded="$(curl -sf -m 10 "http://127.0.0.1:${PORT}/api/nodes/models" | loaded_tsv)"
+        if [[ -z "$loaded" ]]; then info "loaded now: none (models load on the first request)"
+        else info "loaded now: $(awk -F'\t' '{print $1" ("$2")"}' <<<"$loaded" | sort | uniq -c | awk '{$1=$1" x"; print}' | paste -sd, -)"; fi
+    fi
+
+    # ---------------------------------------------------------------- worker
+    if [[ "$ROLE" == worker ]]; then
+        url="http://${SERVER}:${PORT}"
+        section "Host ${SERVER}"
+        if curl -sf -m 5 -o /dev/null "${url}/readyz"; then ok "host answers on ${url}"
+        else fail "host does not answer on ${url}: is it started, is LOCALAI_SERVER right, is TCP ${PORT} open in the host's firewall?"; fi
+        if tcp_open "$SERVER" 4222; then ok "NATS port ${SERVER}:4222 is open"
+        else fail "NATS port ${SERVER}:4222 is closed: open TCP 4222 in the host's firewall"; fi
+        code="$(curl -s -m 10 -o /dev/null -w '%{http_code}' -H "X-Registration-Token: ${TOKEN}" "${url}/_cluster/files")"
+        case "$code" in
+            200) ok "join token accepted (model files can be synced)";;
+            401) fail "join token rejected: copy the host's .env to this PC again";;
+            *)   fail "model file list: HTTP ${code} (is the host up to date?)";;
+        esac
+
+        section "This worker"
+        name="$(env_get WORKER_NAME)"; name="${name:-$(hostname)}"
+        nodes="$(curl -sf -m 10 "${url}/api/nodes" | nodes_tsv)"
+        line="$(awk -F'\t' -v n="$name" 'tolower($1) == tolower(n)' <<<"$nodes" | head -1)"
+        if [[ -z "$line" ]]; then
+            fail "this PC (${name}) is not registered with the host: is the worker started?"
+        else
+            IFS=$'\t' read -r _ status addr http_addr beat <<<"$line"
+            if [[ "$status" == healthy ]]; then ok "registered as ${name}: ${status} (last heartbeat ${beat%.*})"
+            else fail "registered as ${name}: ${status} (last heartbeat ${beat%.*})"; fi
+            info "the host connects back to ${http_addr} and ${addr}: run this check on the host to test that"
+            if [[ " ${MY_IPS} " != *" ${addr%:*} "* ]]; then
+                warn "the host knows this PC as ${addr%:*}, which is not one of its addresses (${MY_IPS% }): set WORKER_IP in .env"
+            fi
+        fi
+        check_container localai-worker
+        check_container localai-worker-sync
+        last="$(docker logs --tail 50 localai-worker-sync 2>/dev/null | grep -E 'in sync|downloading|waiting|%' | tail -1)"
+        case "$last" in
+            *"in sync"*) ok "model files: ${last#* }";;
+            "")          warn "model files: the sync has not reported yet";;
+            *)           warn "model files: ${last#* }";;
+        esac
+    fi
+
+    echo
+    if (( FAILED )); then echo "Some checks failed."; exit 1; fi
+    echo "All checks passed."
+}
+
 case "${1:-}" in
     host)
         check_docker
@@ -173,8 +341,12 @@ case "${1:-}" in
         fi
         [[ -n "$content" ]] || die "the model returned an empty reply"
         ;;
+    diagnose)
+        ( set +e; diagnose )
+        exit $?
+        ;;
     *)
-        echo "Usage: $0 host|worker|model-capacity [model]|model-list-all|useChatCompletions [prompt] [model]" >&2
+        echo "Usage: $0 host|worker|diagnose|model-capacity [model]|model-list-all|useChatCompletions [prompt] [model]" >&2
         exit 2
         ;;
 esac

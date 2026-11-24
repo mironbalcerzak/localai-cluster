@@ -47,12 +47,8 @@ Both scripts run in the foreground and show the logs; Ctrl+C stops everything.
 
 **Check that the host reaches each worker.** A worker connects out to the host, so it
 shows as healthy in the web UI even when the host cannot connect back to it, yet every
-model load and request the host sends to it then hangs. From the host, with the worker
-running (any HTTP answer means the port is open; a timeout means it is blocked):
-```
-curl -m 5 http://<worker-ip>:50050/
-curl -m 5 http://<worker-ip>:50051/
-```
+model load and request the host sends to it then hangs. Run `diagnose` on the host
+(see Diagnose below): it tests every registered worker's ports from the host.
 
 Check GPU access in Docker on either system:
 `docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi`
@@ -118,6 +114,26 @@ with the host's and downloads what is missing from the host (about 12 GB the fir
 time, over the network, resumed after an interruption). So a model is already on the
 PC when the host loads it here. Follow it with `docker logs -f localai-worker-sync`.
 The host's own GPU worker has the same service (`worker-sync`).
+
+## Diagnose
+
+```
+./localai-cluster.sh diagnose      (Windows: localai-cluster.bat diagnose)
+```
+
+Finds out whether this PC is the host (`LOCALAI_SERVER` is one of its addresses, or the
+host stack runs here) or a worker, and checks what that role needs. Read-only: it sends
+no inference requests and changes nothing. Each check prints OK, WARN or FAIL with what
+to do; the exit code is 1 when a check failed.
+
+- **Host:** the host containers; LocalAI answering on 127.0.0.1 and on the LAN address;
+  NATS (4222) open; every worker registered with this host, its health, and whether
+  this PC can reach its file port (50050) and model port (50051); the models from
+  `.env` installed, and what is loaded now.
+- **Worker:** the host answering (API and NATS); the join token accepted; this PC
+  registered and healthy, under the address the host uses for it; the worker and sync
+  containers running; the sync's last status. Whether the host can connect back to this
+  PC is tested by running `diagnose` on the host.
 
 ## Capacity
 

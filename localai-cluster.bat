@@ -5,6 +5,10 @@ rem   localai-cluster.bat host     run the server (API + web UI) and use this PC
 rem                        The first run creates .env next to this script.
 rem   localai-cluster.bat worker   lend this PC's GPU to the host. Needs the host's .env
 rem                        copied next to this script.
+rem   localai-cluster.bat diagnose
+rem                        check the connections this PC needs: as host (LocalAI, NATS, every
+rem                        registered worker reachable from here) or as worker (host, token,
+rem                        registration, containers, model sync). Read-only.
 rem   localai-cluster.bat model-capacity [model]
 rem                        print how many requests the cluster serves at once for a model
 rem                        (slots per PC x PCs with it loaded; LOCALAI_MODEL by default).
@@ -21,10 +25,11 @@ set "ENV_FILE=%ROOT%.env"
 
 if /i "%~1"=="host" goto :host
 if /i "%~1"=="worker" goto :worker
+if /i "%~1"=="diagnose" goto :diagnose
 if /i "%~1"=="model-capacity" goto :model_capacity
 if /i "%~1"=="model-list-all" goto :model_list_all
 if /i "%~1"=="useChatCompletions" goto :use_chat_completions
-echo Usage: %~nx0 host^|worker^|model-capacity [model]^|model-list-all^|useChatCompletions [prompt] [model]
+echo Usage: %~nx0 host^|worker^|diagnose^|model-capacity [model]^|model-list-all^|useChatCompletions [prompt] [model]
 echo %CMDCMDLINE% | find /i "%~nx0" >nul && pause
 exit /b 2
 
@@ -61,6 +66,13 @@ exit /b 1
 if not defined WORKER_NAME set "WORKER_NAME=%COMPUTERNAME%"
 echo LocalAI worker '%WORKER_NAME%' (%WORKER_IP%) -^> host %LOCALAI_SERVER%. Ctrl+C stops it.
 docker compose -p localai-worker --env-file "%ENV_FILE%" -f "%ROOT%docker\worker\docker-compose.yml" up --build
+exit /b %ERRORLEVEL%
+
+rem ---------------------------------------------------------------- diagnose
+rem The checks are PowerShell, kept at the end of this file after the DIAGNOSE marker line:
+rem cmd never runs past the last "exit /b", and this reads that part and runs it.
+:diagnose
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$t = [IO.File]::ReadAllText('%~f0'); $i = $t.IndexOf('rem DIAGNOSE' + '-POWERSHELL'); $i = $t.IndexOf([char]10, $i) + 1; & ([scriptblock]::Create($t.Substring($i)))"
 exit /b %ERRORLEVEL%
 
 rem ---------------------------------------------------------------- model-capacity / model-list-all
@@ -165,3 +177,157 @@ call :secret PGPASS
 )
 echo Created "%ENV_FILE%": copy it next to localai-cluster.sh / localai-cluster.bat on every worker PC.
 exit /b 0
+
+rem DIAGNOSE-POWERSHELL: everything below is PowerShell for "diagnose"; cmd never gets here.
+$ErrorActionPreference = 'Continue'
+$EnvFile = Join-Path $env:ROOT '.env'
+$script:Failed = $false
+
+function Ok($t)      { Write-Host '  OK    ' -ForegroundColor Green -NoNewline; Write-Host $t }
+function Warn($t)    { Write-Host '  WARN  ' -ForegroundColor Yellow -NoNewline; Write-Host $t }
+function Fail($t)    { Write-Host '  FAIL  ' -ForegroundColor Red -NoNewline; Write-Host $t; $script:Failed = $true }
+function Info($t)    { Write-Host "        $t" }
+function Section($t) { Write-Host ''; Write-Host $t }
+
+# Can a TCP connection be made within 5 seconds?
+function Test-Tcp($HostName, $Port) {
+    $c = New-Object System.Net.Sockets.TcpClient
+    try { return $c.ConnectAsync($HostName, [int]$Port).Wait(5000) -and $c.Connected } catch { return $false } finally { $c.Close() }
+}
+
+# Does anything answer HTTP at the URL (any status code)?
+function Test-HttpAny($Url) {
+    try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 $Url | Out-Null; return $true }
+    catch { return $null -ne $_.Exception.Response }
+}
+
+function Test-Ready($Url) {
+    try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 "$Url/readyz" | Out-Null; return $true } catch { return $false }
+}
+
+function Get-Json($Url, $Headers = @{}) {
+    try { return Invoke-RestMethod -TimeoutSec 10 -Headers $Headers $Url } catch { return $null }
+}
+
+function Get-ContainerState($Name) {
+    $s = docker inspect -f '{{.State.Status}}{{if .State.Health}} ({{.State.Health.Status}}){{end}}' $Name 2>$null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return "$s".Trim()
+}
+
+function Check-Container($Name) {
+    $st = Get-ContainerState $Name
+    if (-not $st) { Fail "container $Name does not exist" }
+    elseif ($st -like 'running*' -and $st -notlike '*unhealthy*') { Ok "container ${Name}: $st" }
+    else { Fail "container ${Name}: $st" }
+}
+
+# ---------------------------------------------------------------- basics
+Section 'Basics'
+if (-not (Test-Path $EnvFile)) { Fail "missing $EnvFile"; exit 1 }
+Ok ".env found: $EnvFile"
+$cfg = @{}
+foreach ($line in Get-Content $EnvFile) {
+    if ($line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$') { $cfg[$Matches[1]] = $Matches[2] }
+}
+if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { Fail 'Docker Desktop is not installed' }
+else {
+    docker info *> $null
+    if ($LASTEXITCODE -eq 0) { Ok 'Docker is running' } else { Fail 'Docker Desktop is not running' }
+}
+
+$Server = $cfg['LOCALAI_SERVER']
+$Port = if ($cfg['LOCALAI_PORT']) { $cfg['LOCALAI_PORT'] } else { '23422' }
+$Token = $cfg['LOCALAI_REGISTRATION_TOKEN']
+if (-not $Server) { Fail 'LOCALAI_SERVER is empty in .env'; exit 1 }
+$MyIps = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object { $_.IPAddress })
+Info "host in .env: ${Server}:$Port; this PC: $env:COMPUTERNAME ($($MyIps -join ', '))"
+
+if ($MyIps -contains $Server -or (Get-ContainerState 'localai-proxy-1')) {
+    $Role = 'host'; Info 'role: host (LOCALAI_SERVER is this PC, or the host stack runs here)'
+} else {
+    $Role = 'worker'; Info 'role: worker (LOCALAI_SERVER is another PC)'
+}
+
+# ---------------------------------------------------------------- host
+if ($Role -eq 'host') {
+    Section 'Host containers'
+    foreach ($c in 'localai-proxy-1', 'localai-frontend-1', 'localai-worker-local-1', 'localai-worker-sync-1', 'localai-postgres-1', 'localai-nats-1') {
+        Check-Container $c
+    }
+
+    Section 'Host reachable'
+    $local = "http://127.0.0.1:$Port"
+    if (Test-Ready $local) { Ok "LocalAI answers on $local" } else { Fail "LocalAI does not answer on $local (is the host started?)" }
+    if (Test-Ready "http://${Server}:$Port") { Ok "LocalAI answers on the LAN address http://${Server}:$Port" }
+    else { Fail "LocalAI does not answer on http://${Server}:${Port}: wrong LOCALAI_SERVER in .env, or the firewall (TCP $Port)" }
+    if (Test-Tcp $Server 4222) { Ok "NATS port ${Server}:4222 is open (workers connect to it)" }
+    else { Fail "NATS port ${Server}:4222 is closed: workers cannot connect (firewall, TCP 4222)" }
+
+    Section 'Workers registered with this host'
+    $nodes = @(Get-Json "$local/api/nodes")
+    if (-not $nodes -or $nodes.Count -eq 0 -or $null -eq $nodes[0]) { Warn 'no workers registered' }
+    foreach ($n in $nodes) {
+        if ($null -eq $n) { continue }
+        $beat = "$($n.last_heartbeat)" -replace '\..*$', ''
+        if ($n.status -eq 'healthy') { Ok "$($n.name): $($n.status) (last heartbeat $beat)" } else { Fail "$($n.name): $($n.status) (last heartbeat $beat)" }
+        if ("$($n.address)" -like 'worker-local:*') { Info "this PC's own GPU worker, reached inside Docker"; continue }
+        # The host connects back to every worker: file uploads and model loads (50050), inference (50051).
+        if (Test-HttpAny "http://$($n.http_address)/") { Ok "$($n.name): file port $($n.http_address) reachable from this host" }
+        else { Fail "$($n.name): file port $($n.http_address) NOT reachable from this host: open TCP 50050-50059 in that PC's firewall (see README)" }
+        $a = "$($n.address)".Split(':')
+        if (Test-Tcp $a[0] $a[1]) { Ok "$($n.name): model port $($n.address) reachable from this host" }
+        else { Fail "$($n.name): model port $($n.address) NOT reachable from this host: open TCP 50050-50059 in that PC's firewall (see README)" }
+    }
+
+    Section 'Models'
+    $installed = @((Get-Json "$local/v1/models").data | ForEach-Object { $_.id })
+    foreach ($want in $cfg['LOCALAI_MODEL'], $cfg['LOCALAI_EMBEDDING_MODEL']) {
+        if (-not $want) { continue }
+        if ($installed -contains $want) { Ok "installed: $want" }
+        else { Warn "not installed (yet): ${want}: the proxy installs it on start, see docker logs localai-proxy-1" }
+    }
+    $loaded = @(Get-Json "$local/api/nodes/models")
+    if (-not $loaded -or $null -eq $loaded[0]) { Info 'loaded now: none (models load on the first request)' }
+    else { Info ('loaded now: ' + (($loaded | Group-Object model_name | ForEach-Object { "$($_.Name) on $($_.Count) PC(s)" }) -join ', ')) }
+}
+
+# ---------------------------------------------------------------- worker
+if ($Role -eq 'worker') {
+    $url = "http://${Server}:$Port"
+    Section "Host $Server"
+    if (Test-Ready $url) { Ok "host answers on $url" }
+    else { Fail "host does not answer on ${url}: is it started, is LOCALAI_SERVER right, is TCP $Port open in the host's firewall?" }
+    if (Test-Tcp $Server 4222) { Ok "NATS port ${Server}:4222 is open" } else { Fail "NATS port ${Server}:4222 is closed: open TCP 4222 in the host's firewall" }
+    try {
+        Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 -Headers @{ 'X-Registration-Token' = $Token } "$url/_cluster/files" | Out-Null
+        Ok 'join token accepted (model files can be synced)'
+    } catch {
+        $code = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+        if ($code -eq 401) { Fail "join token rejected: copy the host's .env to this PC again" }
+        else { Fail "model file list: HTTP $code (is the host up to date?)" }
+    }
+
+    Section 'This worker'
+    $name = if ($cfg['WORKER_NAME']) { $cfg['WORKER_NAME'] } else { $env:COMPUTERNAME }
+    $me = @(Get-Json "$url/api/nodes") | Where-Object { $_ -and $_.name -eq $name } | Select-Object -First 1
+    if (-not $me) { Fail "this PC ($name) is not registered with the host: is the worker started?" }
+    else {
+        $beat = "$($me.last_heartbeat)" -replace '\..*$', ''
+        if ($me.status -eq 'healthy') { Ok "registered as ${name}: $($me.status) (last heartbeat $beat)" } else { Fail "registered as ${name}: $($me.status) (last heartbeat $beat)" }
+        Info "the host connects back to $($me.http_address) and $($me.address): run this check on the host to test that"
+        $ip = "$($me.address)".Split(':')[0]
+        if ($MyIps -notcontains $ip) { Warn "the host knows this PC as $ip, which is not one of its addresses ($($MyIps -join ', ')): set WORKER_IP in .env" }
+    }
+    Check-Container 'localai-worker'
+    Check-Container 'localai-worker-sync'
+    $last = docker logs --tail 50 localai-worker-sync 2>&1 | Where-Object { "$_" -match 'in sync|downloading|waiting|%' } | Select-Object -Last 1
+    $msg = "$last" -replace '^\S+\s+', ''
+    if ("$last" -match 'in sync') { Ok "model files: $msg" }
+    elseif (-not $last) { Warn 'model files: the sync has not reported yet' }
+    else { Warn "model files: $msg" }
+}
+
+Write-Host ''
+if ($script:Failed) { Write-Host 'Some checks failed.'; exit 1 }
+Write-Host 'All checks passed.'

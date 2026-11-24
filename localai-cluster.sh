@@ -1,9 +1,9 @@
 #!/bin/bash
 # LocalAI cluster. Runs in the foreground; Ctrl+C stops it.
 #
-#   ./localai.sh host     run the server (API + web UI) and use this PC's GPU.
+#   ./localai-cluster.sh host     run the server (API + web UI) and use this PC's GPU.
 #                         The first run creates .env next to this script.
-#   ./localai.sh worker   lend this PC's GPU to the host. Needs the host's .env
+#   ./localai-cluster.sh worker   lend this PC's GPU to the host. Needs the host's .env
 #                         copied next to this script.
 set -euo pipefail
 
@@ -33,7 +33,7 @@ create_env() {
         umask 077
         cat > "$ENV_FILE" <<EOF
 # LocalAI cluster settings, created by the host on its first run.
-# Copy this file next to localai.sh / localai.bat on every worker PC.
+# Copy this file next to localai-cluster.sh / localai-cluster.bat on every worker PC.
 
 # Address of the host. Update it here and on the workers if the host's IP changes.
 LOCALAI_SERVER=${ip}
@@ -55,7 +55,7 @@ WORKER_IP=
 WORKER_NAME=
 EOF
     )
-    echo "Created ${ENV_FILE}: copy it next to localai.sh / localai.bat on every worker PC."
+    echo "Created ${ENV_FILE}: copy it next to localai-cluster.sh / localai-cluster.bat on every worker PC."
 }
 
 case "${1:-}" in

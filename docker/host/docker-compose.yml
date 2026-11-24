@@ -1,18 +1,18 @@
-# LocalAI host: the server of the cluster. Started by ../../localai.sh host (or .bat).
+# LocalAI host: the server of the cluster. Started by ../../localai-cluster.sh host (or .bat).
 #
 #   frontend      API + web UI on :${LOCALAI_PORT}. Routes every request to a worker.
 #   worker-local  the GPU of this PC, registered as a worker like any other.
 #   postgres      users, API keys, node registry (required by distributed mode).
 #   nats          message bus; remote workers connect to :4222.
 #
-# Other PCs join with ../../localai.sh worker (or .bat).
+# Other PCs join with ../../localai-cluster.sh worker (or .bat).
 # Settings and secrets live in the .env next to the start scripts (created by the host).
 
 name: ${COMPOSE_PROJECT_NAME:-localai}
 
 x-common-env: &common-env
   LOCALAI_NATS_URL: "nats://nats:4222"
-  LOCALAI_REGISTRATION_TOKEN: "${LOCALAI_REGISTRATION_TOKEN:?start with localai.sh host / localai.bat host, which creates .env}"
+  LOCALAI_REGISTRATION_TOKEN: "${LOCALAI_REGISTRATION_TOKEN:?start with localai-cluster.sh host / localai-cluster.bat host, which creates .env}"
   GODEBUG: "netdns=go"
 
 services:

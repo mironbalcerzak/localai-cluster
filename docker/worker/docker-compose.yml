@@ -1,4 +1,4 @@
-# LocalAI cluster worker. Started by ../../localai.sh worker (or .bat).
+# LocalAI cluster worker. Started by ../../localai-cluster.sh worker (or .bat).
 # Settings come from the .env next to the start scripts (created by the host).
 name: localai-worker
 
@@ -14,7 +14,7 @@ services:
       LOCALAI_SERVER_PORT: "${LOCALAI_PORT:-23422}"
       LOCALAI_REGISTRATION_TOKEN: "${LOCALAI_REGISTRATION_TOKEN:?set LOCALAI_REGISTRATION_TOKEN in .env}"
       # The start scripts fill these in when they are empty in .env.
-      WORKER_IP: "${WORKER_IP:?start with localai.sh worker / localai.bat worker, or set WORKER_IP in .env}"
+      WORKER_IP: "${WORKER_IP:?start with localai-cluster.sh worker / localai-cluster.bat worker, or set WORKER_IP in .env}"
       WORKER_NAME: "${WORKER_NAME:-}"
       LLAMACPP_PARALLEL: "${LLAMACPP_PARALLEL:-5}"
     ports:

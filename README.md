@@ -7,7 +7,7 @@ requests. Each PC serves `LLAMACPP_PARALLEL` requests at once (5 by default), so
 every PC added raises the total.
 
 ```
-localai.sh / localai.bat   host | worker
+localai-cluster.sh / .bat   host | worker
 .env                       cluster settings, created by the host (gitignored)
 .env.example               the format of .env
 docker/host/               host compose stack (API, Postgres, NATS, local GPU worker)
@@ -44,7 +44,7 @@ Give every PC a fixed IP (DHCP reservation in the router).
 ## Host
 
 ```
-./localai.sh host        (Windows: localai.bat host)
+./localai-cluster.sh host        (Windows: localai-cluster.bat host)
 ```
 
 The first run creates `.env` next to the script: the host's IP, a join token,
@@ -61,7 +61,7 @@ the host then loads it on every PC.
 1. Check out this repo and copy the host's `.env` next to the scripts.
 2. Run:
    ```
-   ./localai.sh worker      (Windows: localai.bat worker)
+   ./localai-cluster.sh worker      (Windows: localai-cluster.bat worker)
    ```
 
 This PC's IP and name are detected (override with `WORKER_IP` / `WORKER_NAME` in

@@ -12,6 +12,10 @@
 // Mirror   Every 5 s: a model loaded on any PC is switched to "a copy on every PC" (LocalAI
 //          scheduling spread_all), so all PCs load it together; when this proxy unloads it,
 //          it goes back to "load on demand" first, so it leaves every PC together.
+// Pin      For diagnosing: a request with "X-Cluster-Worker: <worker name>" runs on that PC.
+//          The model is restricted to that PC and reloaded there for the request; afterwards
+//          it is spread to every PC again. The answer names the PC that served it
+//          ("X-Cluster-Worker-Served", from LocalAI's X-LocalAI-Node).
 // Files    Workers' sync service (docker/worker/sync) downloads the host's model files from
 //          /_cluster/files (needs the join token), so a load on a worker finds them in place.
 // Install  At start, LOCALAI_MODEL and LOCALAI_EMBEDDING_MODEL are installed on the host when
@@ -265,15 +269,22 @@ const scheduling = new Map(); // model -> "all" | "demand", as last set in Local
 const unloadedAt = new Map(); // model -> when this proxy unloaded it
 let schedulingRead = false;
 
+// mode: "all" (a copy on every PC), "demand" (load on demand) or "pin:<worker>" (that PC only).
 async function setScheduling(model, mode) {
-  if (scheduling.get(model) === mode) return;
+  if (scheduling.get(model) === mode) return true;
   const body = mode === "all"
     ? { model_name: model, spread_all: true }
-    : { model_name: model, min_replicas: 0, max_replicas: 64 };
+    : mode.startsWith("pin:")
+      ? { model_name: model, node_selector: { "node.name": mode.slice(4) }, min_replicas: 0, max_replicas: 1 }
+      : { model_name: model, min_replicas: 0, max_replicas: 64 };
   const r = await api("POST", "/api/nodes/scheduling", body);
-  if (r.status !== 200) return log(`mirror: could not change ${model}: HTTP ${r.status} ${r.text.slice(0, 200)}`);
+  if (r.status !== 200) {
+    log(`mirror: could not change ${model}: HTTP ${r.status} ${r.text.slice(0, 200)}`);
+    return false;
+  }
   scheduling.set(model, mode);
-  log(`mirror: ${model} ${mode === "all" ? "loads on every PC" : "loads on demand again"}`);
+  log(`mirror: ${model} ${mode === "all" ? "loads on every PC" : mode === "demand" ? "loads on demand again" : `runs on ${mode.slice(4)} only`}`);
+  return true;
 }
 
 // A model loaded anywhere runs on every PC. Right after this proxy unloaded a model, a copy
@@ -288,9 +299,77 @@ async function mirror() {
     const loaded = await loadedModels();
     const names = new Set([...loaded.keys(), ...[...scheduling].filter(([, m]) => m === "all").map(([n]) => n)]);
     for (const name of names) {
+      if (pinned.has(name)) continue; // a diagnose request has it on one PC
       const justUnloaded = Date.now() - (unloadedAt.get(name) || 0) < 60_000 && !(usage.get(name)?.active > 0);
       await setScheduling(name, loaded.has(name) && !justUnloaded ? "all" : "demand");
     }
+  });
+}
+
+// ---------------------------------------------------------------- pin a request to one worker
+
+const pinned = new Map(); // model -> worker name, while a pinned request runs
+
+class PinError extends Error {
+  constructor(status, message) { super(message); this.status = status; }
+}
+
+let nodeNames = new Map(); // node id -> name
+async function workerNames() {
+  const r = await api("GET", "/api/nodes");
+  nodeNames = new Map((Array.isArray(r.json) ? r.json : []).map((n) => [n.id, n.name]));
+  return Array.isArray(r.json) ? r.json : [];
+}
+async function nodeName(id) {
+  if (!nodeNames.has(id)) await workerNames().catch(() => {});
+  return nodeNames.get(id) || id;
+}
+
+// Move `model` to one worker for a request, then reserve a slot like admit(). Returns the
+// worker's name as LocalAI knows it.
+async function admitPinned(model, worker, isGone) {
+  const node = (await workerNames()).find((n) => String(n.name).toLowerCase() === worker.toLowerCase());
+  if (!node) throw new PinError(404, `no worker named "${worker}"; registered: ${[...nodeNames.values()].join(", ") || "none"}`);
+  if (node.status !== "healthy") throw new PinError(503, `worker ${node.name} is ${node.status}`);
+  const deadline = Date.now() + EVICT_WAIT_MS;
+  for (;;) {
+    const ready = await exclusive(async () => {
+      if (pinned.has(model) && pinned.get(model) !== node.name) return false; // another pinned test runs
+      const loaded = await loadedModels();
+      if (usage.get(model)?.active > 0 || loaded.get(model)?.inFlight > 0) return pinned.get(model) === node.name;
+      if (pinned.get(model) !== node.name) {
+        pinned.set(model, node.name);
+        if (!(await setScheduling(model, `pin:${node.name}`))) {
+          pinned.delete(model);
+          throw new PinError(502, `could not restrict ${model} to ${node.name}`);
+        }
+        if (loaded.has(model)) {
+          log(`pin: unload ${model} everywhere, to load it on ${node.name} only`);
+          const r = await api("POST", "/backend/shutdown", { model });
+          if (r.status !== 200 && r.status !== 404) log(`pin: unload ${model}: HTTP ${r.status}`);
+          for (let i = 0; i < 60 && (await loadedModels()).has(model); i++) await sleep(500);
+          await sleep(1000);
+        }
+      }
+      return true;
+    });
+    if (ready) break;
+    if (isGone()) throw new Busy("client gone");
+    if (Date.now() > deadline) throw new Busy(`${model} stayed busy for ${EVICT_WAIT_MS / 1000}s`);
+    await sleep(2000);
+  }
+  log(`pin: ${model} request runs on ${node.name}`);
+  await admit(model, isGone);
+  return node.name;
+}
+
+// After the last pinned request: lift the restriction; the mirror spreads the model again.
+async function unpin(model) {
+  if ((usage.get(model)?.active || 0) > 0) return;
+  await exclusive(async () => {
+    if (!pinned.has(model)) return;
+    await setScheduling(model, "demand");
+    pinned.delete(model);
   });
 }
 
@@ -459,8 +538,11 @@ function forward(req, res, headers, body, done = () => {}) {
   }
   const up = http.request(
     { agent, host: UPSTREAM_HOST, port: UPSTREAM_PORT, method: req.method, path: req.url, headers },
-    (upRes) => {
-      res.writeHead(upRes.statusCode, upRes.headers);
+    async (upRes) => {
+      const headers = { ...upRes.headers };
+      const node = headers["x-localai-node"];
+      if (node) headers["x-cluster-worker-served"] = await nodeName(node);
+      res.writeHead(upRes.statusCode, headers);
       upRes.pipe(res);
       upRes.on("end", finish);
       upRes.on("error", finish);
@@ -498,15 +580,24 @@ async function handle(req, res) {
 
   let gone = false;
   res.on("close", () => { gone = true; });
+  const worker = String(req.headers["x-cluster-worker"] || "").trim();
+  delete headers["x-cluster-worker"];
   try {
-    await admit(model, () => gone);
+    if (worker) await admitPinned(model, worker, () => gone);
+    else await admit(model, () => gone);
   } catch (e) {
+    if (worker) unpin(model).catch(() => {});
+    if (e instanceof PinError) return sendError(res, e.status, e.message);
     if (e instanceof Busy) return gone ? undefined : sendError(res, 503, e.message, { "Retry-After": "30" });
     log(`admit ${model}: ${e.message}`);
     return sendError(res, 502, `LocalAI frontend: ${e.message}`);
   }
-  if (gone) return release(model);
-  forward(req, res, headers, body, () => release(model));
+  const done = () => {
+    release(model);
+    if (worker) unpin(model).catch((e) => log(`pin: ${e.message}`));
+  };
+  if (gone) return done();
+  forward(req, res, headers, body, done);
 }
 
 // WebSockets (web UI): pass the upgrade through with the same auth handling.

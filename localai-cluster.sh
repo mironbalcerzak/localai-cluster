@@ -8,17 +8,20 @@
 #   ./localai-cluster.sh diagnose
 #                         check the connections this PC needs: as host (LocalAI, NATS, every
 #                         registered worker reachable from here) or as worker (host, token,
-#                         registration, containers, model sync). Read-only.
+#                         registration, containers, model sync), and whether this PC's
+#                         models run on its GPU. Read-only.
 #   ./localai-cluster.sh model-capacity [model]
 #                         print how many requests the cluster serves at once for a model
 #                         (slots per PC x PCs with it loaded; LOCALAI_MODEL by default).
 #                         Only the number goes to stdout; details go to stderr.
 #   ./localai-cluster.sh model-list-all
 #                         list every model of the host as "<model><TAB><capacity>".
-#   ./localai-cluster.sh useChatCompletions [prompt] [model]
+#   ./localai-cluster.sh useChatCompletions [prompt] [model] [worker]
 #                         send a prompt to the cluster (/v1/chat/completions) and print the
 #                         reply. Without a prompt (or with "-") it is read from stdin. The
-#                         model is LOCALAI_MODEL by default. Needs jq or python3.
+#                         model is LOCALAI_MODEL by default ("" for the default too). With a
+#                         worker name, the request runs on that PC (for diagnosing). The PC
+#                         that served it goes to stderr. Needs jq or python3.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
@@ -145,14 +148,59 @@ mode, d = sys.argv[1], json.load(sys.stdin)
 rows = {
     "nodes":  lambda: [[n.get(k) or "" for k in ("name", "status", "address", "http_address", "last_heartbeat")] for n in d],
     "models": lambda: [[m["id"]] for m in d.get("data", [])],
-    "loaded": lambda: [[r["model_name"], r["state"]] for r in d],
+    "loaded": lambda: [[r["model_name"], r["state"], r.get("node_id") or ""] for r in d],
+    "gpus":   lambda: [[n.get(k) or "" for k in ("name", "id", "gpu_vendor", "total_vram", "address")] for n in d],
 }[mode]()
 for r in rows: print("\t".join(str(x) for x in r))
 ' "$1"
 }
 nodes_tsv()  { if command -v jq >/dev/null; then jq -r '.[] | [.name, .status, .address, .http_address, .last_heartbeat] | @tsv'; else py_tsv nodes; fi; }
 models_tsv() { if command -v jq >/dev/null; then jq -r '.data[].id'; else py_tsv models; fi; }
-loaded_tsv() { if command -v jq >/dev/null; then jq -r '.[] | [.model_name, .state] | @tsv'; else py_tsv loaded; fi; }
+loaded_tsv() { if command -v jq >/dev/null; then jq -r '.[] | [.model_name, .state, .node_id] | @tsv'; else py_tsv loaded; fi; }
+gpus_tsv()   { if command -v jq >/dev/null; then jq -r '.[] | [.name, .id, .gpu_vendor, .total_vram, .address] | @tsv'; else py_tsv gpus; fi; }
+
+# check_gpu URL CONTAINER NODE: does this PC's LocalAI worker run models on the GPU?
+# NODE is the worker's name as registered with the host ("worker-local" for the host's own).
+check_gpu() {
+    local url="$1" c="$2" node="$3" line id vendor vram gpu backend used total models
+    section "GPU (this PC: ${c})"
+    if command -v nvidia-smi >/dev/null; then
+        gpu="$(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>/dev/null | head -1)"
+        if [[ -n "$gpu" ]]; then ok "NVIDIA driver on this PC: ${gpu}"; else fail "nvidia-smi is installed but finds no GPU: check the NVIDIA driver"; fi
+    else
+        warn "nvidia-smi not found on this PC: is the NVIDIA driver installed?"
+    fi
+    if [[ -z "$(container_state "$c")" ]]; then fail "container ${c} does not exist: GPU checks skipped"; return; fi
+    gpu="$(docker exec "$c" nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)"
+    if [[ -n "$gpu" ]]; then
+        IFS=',' read -r _ used total <<<"$gpu"; used="${used// /}"; total="${total// /}"
+        ok "container ${c} sees the GPU: ${gpu%%,*} (${used} of ${total} MiB in use)"
+    else
+        fail "container ${c} cannot see the GPU: models would run on the CPU. Linux: install the NVIDIA Container Toolkit; Windows: Docker Desktop with WSL 2 and an up-to-date NVIDIA driver"
+    fi
+    backend="$(docker exec "$c" cat /backends/llama-cpp/metadata.json 2>/dev/null | sed -n 's/.*"meta_backend_for": *"\([^"]*\)".*/\1/p')"
+    case "$backend" in
+        "")                    info "llama.cpp backend: not installed yet (the host installs it on the first model load)";;
+        *cuda*|*nvidia*)       ok "llama.cpp backend: ${backend} (GPU build)";;
+        *)                     fail "llama.cpp backend: ${backend}, not a CUDA build: models run on the CPU. Remove the worker's backends volume and restart it";;
+    esac
+    line="$(curl -sf -m 10 "${url}/api/nodes" | gpus_tsv | awk -F'\t' -v n="$node" 'tolower($1) == tolower(n) || ($5 ~ "^" n ":")' | head -1)"
+    if [[ -z "$line" ]]; then
+        warn "LocalAI's view of this PC's GPU: not registered with the host"
+    else
+        IFS=$'\t' read -r _ id vendor vram _ <<<"$line"
+        if [[ -n "$vendor" && "${vram:-0}" -gt 0 ]]; then ok "LocalAI sees a ${vendor} GPU with $(( vram / 1024 / 1024 / 1024 )) GB VRAM on this PC"
+        else fail "LocalAI sees no GPU on this PC (vendor '${vendor}', VRAM ${vram:-0}): models would run on the CPU"; fi
+        models="$(curl -sf -m 10 "${url}/api/nodes/models" | loaded_tsv | awk -F'\t' -v id="$id" '$3 == id && $2 == "loaded" {print $1}' | paste -sd, -)"
+        if [[ -z "$models" ]]; then
+            info "no model loaded on this PC right now: load one (send a request) and run diagnose again to see it on the GPU"
+        elif [[ -n "$used" ]] && (( used > 1024 )); then
+            ok "loaded here: ${models}; the GPU holds ${used} MiB, so the model runs on the GPU"
+        elif [[ -n "$used" ]]; then
+            fail "loaded here: ${models}, but the GPU holds only ${used} MiB: the model runs on the CPU"
+        fi
+    fi
+}
 
 container_state() { docker inspect -f '{{.State.Status}}{{if .State.Health}} ({{.State.Health.Status}}){{end}}' "$1" 2>/dev/null; }
 
@@ -224,6 +272,8 @@ diagnose() {
             done <<<"$nodes"
         fi
 
+        check_gpu "http://127.0.0.1:${PORT}" localai-worker-local-1 worker-local
+
         section "Models"
         installed="$(curl -sf -m 10 "http://127.0.0.1:${PORT}/v1/models" | models_tsv)"
         for want in "$(env_get LOCALAI_MODEL)" "$(env_get LOCALAI_EMBEDDING_MODEL)"; do
@@ -274,6 +324,7 @@ diagnose() {
             "")          warn "model files: the sync has not reported yet";;
             *)           warn "model files: ${last#* }";;
         esac
+        check_gpu "$url" localai-worker "$name"
     fi
 
     echo
@@ -325,13 +376,18 @@ case "${1:-}" in
         [[ "$prompt" == "-" ]] && prompt="$(cat)"
         [[ -n "$prompt" ]] || die "empty prompt"
         model="${3:-$(env_get LOCALAI_MODEL)}"
+        worker="${4:-}"
         body="$(chat_request "$prompt" "$model")"
-        # Queue wait and model load included: allow up to 10 minutes.
-        response="$(curl -sS -m 600 -H 'Content-Type: application/json' \
+        headers="$(mktemp)"; trap 'rm -f "$headers"' EXIT
+        # Queue wait and model load (a pinned request reloads the model) included: allow 10 minutes.
+        response="$(curl -sS -m 600 -D "$headers" -H 'Content-Type: application/json' \
+            ${worker:+-H "X-Cluster-Worker: ${worker}"} \
             -d "$body" -w '\n%{http_code}' "${API_URL}/v1/chat/completions")" \
             || die "cannot reach ${API_URL}"
         code="${response##*$'\n'}"; response="${response%$'\n'*}"
         [[ "$code" == 200 ]] || die "HTTP ${code}: ${response:0:500}"
+        served="$(sed -n 's/^[Xx]-[Cc]luster-[Ww]orker-[Ss]erved:[[:space:]]*//p' "$headers" | tr -d '\r' | tail -1)"
+        [[ -n "$served" ]] && echo "served by: ${served}" >&2
         reply="$(chat_reply <<<"$response")" || die "unexpected response: ${response:0:500}"
         finish="${reply%%$'\n'*}"; content="${reply#*$'\n'}"
         [[ -n "$content" ]] && printf '%s\n' "$content"
@@ -346,7 +402,7 @@ case "${1:-}" in
         exit $?
         ;;
     *)
-        echo "Usage: $0 host|worker|diagnose|model-capacity [model]|model-list-all|useChatCompletions [prompt] [model]" >&2
+        echo "Usage: $0 host|worker|diagnose|model-capacity [model]|model-list-all|useChatCompletions [prompt] [model] [worker]" >&2
         exit 2
         ;;
 esac

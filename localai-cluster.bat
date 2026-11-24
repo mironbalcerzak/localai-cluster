@@ -15,10 +15,12 @@ rem                        (slots per PC x PCs with it loaded; LOCALAI_MODEL by 
 rem                        Only the number goes to stdout; details go to stderr.
 rem   localai-cluster.bat model-list-all
 rem                        list every model of the host as "<model><TAB><capacity>".
-rem   localai-cluster.bat useChatCompletions [prompt] [model]
+rem   localai-cluster.bat useChatCompletions [prompt] [model] [worker]
 rem                        send a prompt to the cluster (/v1/chat/completions) and print the
 rem                        reply. Without a prompt (or with "-") it is read from stdin. The
-rem                        model is LOCALAI_MODEL by default.
+rem                        model is LOCALAI_MODEL by default ("" for the default too). With a
+rem                        worker name, the request runs on that PC (for diagnosing). The PC
+rem                        that served it goes to stderr.
 setlocal EnableExtensions
 set "ROOT=%~dp0"
 set "ENV_FILE=%ROOT%.env"
@@ -29,7 +31,7 @@ if /i "%~1"=="diagnose" goto :diagnose
 if /i "%~1"=="model-capacity" goto :model_capacity
 if /i "%~1"=="model-list-all" goto :model_list_all
 if /i "%~1"=="useChatCompletions" goto :use_chat_completions
-echo Usage: %~nx0 host^|worker^|diagnose^|model-capacity [model]^|model-list-all^|useChatCompletions [prompt] [model]
+echo Usage: %~nx0 host^|worker^|diagnose^|model-capacity [model]^|model-list-all^|useChatCompletions [prompt] [model] [worker]
 echo %CMDCMDLINE% | find /i "%~nx0" >nul && pause
 exit /b 2
 
@@ -108,8 +110,9 @@ rem special characters need no escaping. Exit codes: 1 error, 3 reply cut off by
 call :cap_init || exit /b 1
 set "CHAT_PROMPT=%~2"
 set "CHAT_MODEL=%~3"
+set "CHAT_WORKER=%~4"
 if not defined CHAT_MODEL set "CHAT_MODEL=%LOCALAI_MODEL%"
-powershell -NoProfile -Command "[Console]::OutputEncoding = [Text.Encoding]::UTF8; $p = $env:CHAT_PROMPT; if (-not $p -or $p -eq '-') { $p = [Console]::In.ReadToEnd() }; if (-not $p.Trim()) { [Console]::Error.WriteLine('Error: empty prompt'); exit 1 }; $body = @{ model = $env:CHAT_MODEL; stream = $false; messages = @(@{ role = 'user'; content = $p }) } | ConvertTo-Json -Depth 5; $u = 'http://' + $env:LOCALAI_SERVER + ':' + $env:LOCALAI_PORT + '/v1/chat/completions'; try { $r = Invoke-RestMethod -Method Post -TimeoutSec 600 -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) $u } catch { $m = $_.ErrorDetails.Message; if (-not $m) { $m = $_.Exception.Message }; [Console]::Error.WriteLine('Error: ' + $m); exit 1 }; $c = $r.choices[0]; if ($c.message.content) { Write-Output $c.message.content }; if ($c.finish_reason -eq 'length') { [Console]::Error.WriteLine('Warning: the reply was cut off (token limit reached)'); exit 3 }; if (-not $c.message.content) { [Console]::Error.WriteLine('Error: the model returned an empty reply'); exit 1 }"
+powershell -NoProfile -Command "[Console]::OutputEncoding = [Text.Encoding]::UTF8; $p = $env:CHAT_PROMPT; if (-not $p -or $p -eq '-') { $p = [Console]::In.ReadToEnd() }; if (-not $p.Trim()) { [Console]::Error.WriteLine('Error: empty prompt'); exit 1 }; $body = @{ model = $env:CHAT_MODEL; stream = $false; messages = @(@{ role = 'user'; content = $p }) } | ConvertTo-Json -Depth 5; $h = @{}; if ($env:CHAT_WORKER) { $h['X-Cluster-Worker'] = $env:CHAT_WORKER }; $u = 'http://' + $env:LOCALAI_SERVER + ':' + $env:LOCALAI_PORT + '/v1/chat/completions'; try { $w = Invoke-WebRequest -UseBasicParsing -Method Post -TimeoutSec 600 -Headers $h -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) $u } catch { $m = $_.ErrorDetails.Message; if (-not $m) { $m = $_.Exception.Message }; [Console]::Error.WriteLine('Error: ' + $m); exit 1 }; $r = [Text.Encoding]::UTF8.GetString($w.RawContentStream.ToArray()) | ConvertFrom-Json; $served = $w.Headers['X-Cluster-Worker-Served']; if ($served) { [Console]::Error.WriteLine('served by: ' + $served) }; $c = $r.choices[0]; if ($c.message.content) { Write-Output $c.message.content }; if ($c.finish_reason -eq 'length') { [Console]::Error.WriteLine('Warning: the reply was cut off (token limit reached)'); exit 3 }; if (-not $c.message.content) { [Console]::Error.WriteLine('Error: the model returned an empty reply'); exit 1 }"
 exit /b %ERRORLEVEL%
 
 rem ---------------------------------------------------------------- helpers
@@ -222,6 +225,37 @@ function Check-Container($Name) {
     else { Fail "container ${Name}: $st" }
 }
 
+# Does this PC's LocalAI worker run models on the GPU? $Node is the worker's name as registered
+# with the host ('worker-local' for the host's own).
+function Check-Gpu($Url, $Container, $Node) {
+    Section "GPU (this PC: $Container)"
+    if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+        $g = nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>$null | Select-Object -First 1
+        if ($g) { Ok "NVIDIA driver on this PC: $g" } else { Fail 'nvidia-smi is installed but finds no GPU: check the NVIDIA driver' }
+    } else { Warn 'nvidia-smi not found on this PC: is the NVIDIA driver installed?' }
+    if (-not (Get-ContainerState $Container)) { Fail "container $Container does not exist: GPU checks skipped"; return }
+    $used = $null
+    $g = docker exec $Container nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader,nounits 2>$null | Select-Object -First 1
+    if ($LASTEXITCODE -eq 0 -and $g) {
+        $p = "$g".Split(',') | ForEach-Object { $_.Trim() }
+        $used = [int]$p[1]
+        Ok "container $Container sees the GPU: $($p[0]) ($($p[1]) of $($p[2]) MiB in use)"
+    } else { Fail "container $Container cannot see the GPU: models would run on the CPU. Use Docker Desktop with WSL 2 and an up-to-date NVIDIA driver" }
+    $meta = docker exec $Container cat /backends/llama-cpp/metadata.json 2>$null | Out-String
+    $backend = if ($meta -match '"meta_backend_for":\s*"([^"]*)"') { $Matches[1] } else { '' }
+    if (-not $backend) { Info 'llama.cpp backend: not installed yet (the host installs it on the first model load)' }
+    elseif ($backend -match 'cuda|nvidia') { Ok "llama.cpp backend: $backend (GPU build)" }
+    else { Fail "llama.cpp backend: $backend, not a CUDA build: models run on the CPU. Remove the worker's backends volume and restart it" }
+    $n = @(Get-Json "$Url/api/nodes") | Where-Object { $_ -and ($_.name -eq $Node -or "$($_.address)" -like "${Node}:*") } | Select-Object -First 1
+    if (-not $n) { Warn "LocalAI's view of this PC's GPU: not registered with the host"; return }
+    if ($n.gpu_vendor -and [double]$n.total_vram -gt 0) { Ok "LocalAI sees a $($n.gpu_vendor) GPU with $([math]::Round([double]$n.total_vram / 1GB)) GB VRAM on this PC" }
+    else { Fail "LocalAI sees no GPU on this PC (vendor '$($n.gpu_vendor)', VRAM $($n.total_vram)): models would run on the CPU" }
+    $models = @(Get-Json "$Url/api/nodes/models") | Where-Object { $_ -and $_.node_id -eq $n.id -and $_.state -eq 'loaded' } | ForEach-Object { $_.model_name }
+    if (-not $models) { Info 'no model loaded on this PC right now: load one (send a request) and run diagnose again to see it on the GPU' }
+    elseif ($null -ne $used -and $used -gt 1024) { Ok "loaded here: $($models -join ', '); the GPU holds $used MiB, so the model runs on the GPU" }
+    elseif ($null -ne $used) { Fail "loaded here: $($models -join ', '), but the GPU holds only $used MiB: the model runs on the CPU" }
+}
+
 # ---------------------------------------------------------------- basics
 Section 'Basics'
 if (-not (Test-Path $EnvFile)) { Fail "missing $EnvFile"; exit 1 }
@@ -280,6 +314,8 @@ if ($Role -eq 'host') {
         else { Fail "$($n.name): model port $($n.address) NOT reachable from this host: open TCP 50050-50059 in that PC's firewall (see README)" }
     }
 
+    Check-Gpu $local 'localai-worker-local-1' 'worker-local'
+
     Section 'Models'
     $installed = @((Get-Json "$local/v1/models").data | ForEach-Object { $_.id })
     foreach ($want in $cfg['LOCALAI_MODEL'], $cfg['LOCALAI_EMBEDDING_MODEL']) {
@@ -326,6 +362,7 @@ if ($Role -eq 'worker') {
     if ("$last" -match 'in sync') { Ok "model files: $msg" }
     elseif (-not $last) { Warn 'model files: the sync has not reported yet' }
     else { Warn "model files: $msg" }
+    Check-Gpu $url 'localai-worker' $name
 }
 
 Write-Host ''

@@ -134,6 +134,11 @@ to do; the exit code is 1 when a check failed.
   registered and healthy, under the address the host uses for it; the worker and sync
   containers running; the sync's last status. Whether the host can connect back to this
   PC is tested by running `diagnose` on the host.
+- **GPU, on both:** whether this PC's own LocalAI worker runs models on its GPU: the
+  NVIDIA driver (`nvidia-smi`), the worker container seeing the GPU, the llama.cpp
+  backend being the CUDA build, LocalAI seeing the GPU and its VRAM, and, when a model is
+  loaded on this PC, the GPU holding it (a loaded model with an almost empty GPU runs on
+  the CPU).
 
 ## Capacity
 
@@ -157,16 +162,29 @@ so check them again from time to time.
 ## Chat from the command line
 
 ```
-./localai-cluster.sh useChatCompletions "prompt" [model]
-echo "prompt" | ./localai-cluster.sh useChatCompletions - [model]
-(Windows: localai-cluster.bat useChatCompletions "prompt" [model])
+./localai-cluster.sh useChatCompletions "prompt" [model] [worker]
+echo "prompt" | ./localai-cluster.sh useChatCompletions - [model] [worker]
+(Windows: localai-cluster.bat useChatCompletions "prompt" [model] [worker])
 ```
 
-Sends the prompt to the cluster (`/v1/chat/completions`, `LOCALAI_MODEL` by default)
-and prints only the reply, so scripts can use it. Without a prompt, or with `-`, the
-prompt is read from stdin. The first request after a start loads the model and can
-take a minute. Exit codes: 1 on an error, 3 when the reply was cut off by the token
-limit. The Linux script needs `jq` or `python3`.
+Sends the prompt to the cluster (`/v1/chat/completions`, `LOCALAI_MODEL` by default; pass
+`""` as the model to keep the default) and prints only the reply, so scripts can use it.
+Without a prompt, or with `-`, the prompt is read from stdin. The PC that served the
+request is printed to stderr (`served by: ...`). Exit codes: 1 on an error, 3 when the
+reply was cut off by the token limit. The Linux script needs `jq` or `python3`.
+
+**Run it on one worker**, for diagnosing:
+
+```
+./localai-cluster.sh useChatCompletions "hi. reply with hello" "" AYA-ALIENWARE
+```
+
+The proxy waits until the model has no running requests, restricts it to that PC
+(LocalAI scheduling `node.name`), unloads it everywhere and sends the request, so the
+model loads on that PC and answers from there. Afterwards the restriction is lifted and
+the model spreads to every PC again. A worker name the host does not know is answered
+with the list of registered workers. Other requests for the same model meanwhile also
+run on that PC only.
 
 ## Security notes
 

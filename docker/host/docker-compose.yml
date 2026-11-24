@@ -94,6 +94,8 @@ services:
       # in the web UI anyway wait for approval.
       LOCALAI_REGISTRATION_MODE: "${LOCALAI_REGISTRATION_MODE:-approval}"
       LOCALAI_VRAM_WARM_LIMIT: "0"
+      # Name the worker that served a request (X-LocalAI-Node; the proxy adds its name).
+      LOCALAI_EXPOSE_NODE_HEADER: "true"
       # Hardware auto-tuning is on: LocalAI picks the parallel request slots per model from
       # the GPU's VRAM, and that wins over LLAMACPP_PARALLEL (only a fallback now). Set
       # LOCALAI_DISABLE_HARDWARE_DEFAULTS=true here to use LLAMACPP_PARALLEL instead.

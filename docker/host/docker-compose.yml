@@ -142,7 +142,10 @@ services:
           devices:
             - driver: nvidia
               count: all
-              capabilities: [gpu, utility]
+              # "compute" brings the CUDA library (libcuda.so.1), "utility" nvidia-smi. Docker
+              # turns this list into NVIDIA_DRIVER_CAPABILITIES; with "utility" alone a
+              # container sees the GPU in nvidia-smi but runs models on the CPU.
+              capabilities: [gpu, compute, utility]
     depends_on:
       frontend:
         condition: service_started

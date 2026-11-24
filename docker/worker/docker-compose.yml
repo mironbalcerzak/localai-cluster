@@ -17,6 +17,8 @@ services:
       WORKER_IP: "${WORKER_IP:?start with localai-cluster.sh worker / localai-cluster.bat worker, or set WORKER_IP in .env}"
       WORKER_NAME: "${WORKER_NAME:-}"
       LLAMACPP_PARALLEL: "${LLAMACPP_PARALLEL:-5}"
+      # The CUDA library (compute) and nvidia-smi (utility), as for the host's own worker.
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
     ports:
       - "50050-50059:50050-50059"
     volumes:
@@ -30,7 +32,10 @@ services:
           devices:
             - driver: nvidia
               count: all
-              capabilities: [gpu, utility]
+              # "compute" brings the CUDA library (libcuda.so.1), "utility" nvidia-smi. Docker
+              # turns this list into NVIDIA_DRIVER_CAPABILITIES; with "utility" alone a
+              # container sees the GPU in nvidia-smi but runs models on the CPU.
+              capabilities: [gpu, compute, utility]
 
   # Keeps this PC's models the same as the host's, so loading one here needs no upload.
   sync:

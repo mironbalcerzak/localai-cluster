@@ -192,6 +192,12 @@ check_gpu() {
     else
         warn "nvidia-smi does not run in container ${c}: LocalAI's own GPU figures below decide"
     fi
+    # nvidia-smi alone proves little: llama.cpp needs the driver's CUDA library.
+    if docker exec "$c" sh -c 'ldconfig -p 2>/dev/null | grep -q "libcuda\.so\.1 " || [ -e /usr/lib/wsl/lib/libcuda.so.1 ]' 2>/dev/null; then
+        ok "container ${c} has the CUDA driver library (libcuda.so.1)"
+    else
+        fail "container ${c} has no CUDA driver library (libcuda.so.1): models run on the CPU. The GPU request must include \"compute\" (NVIDIA_DRIVER_CAPABILITIES=compute,utility): pull and restart"
+    fi
     backend="$(docker exec "$c" cat /backends/llama-cpp/metadata.json 2>/dev/null | sed -n 's/.*"meta_backend_for": *"\([^"]*\)".*/\1/p')"
     case "$backend" in
         "")                    info "llama.cpp backend: not installed yet (the host installs it on the first model load)";;

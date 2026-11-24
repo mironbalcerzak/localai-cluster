@@ -137,7 +137,7 @@ call :secret PGPASS
     echo.
     echo # Model loaded on every PC. Parallel requests per PC are picked by LocalAI from the
     echo # GPU's VRAM; LLAMACPP_PARALLEL is used only when it picks none.
-    echo LOCALAI_MODEL=gemma-4-12b-it-qat-q4_0
+    echo LOCALAI_MODEL=gemma-4-12b-it-Q4_K_M
     echo LLAMACPP_PARALLEL=5
     echo.
     echo # Used by the host only.

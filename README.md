@@ -54,8 +54,11 @@ creates that login as admin: `admin@localai` / `admin123456` by default
 (`LOCALAI_ADMIN_EMAIL` / `LOCALAI_ADMIN_PASSWORD`; the script prints it). Other
 sign-ups wait for approval. API clients send `Authorization: Bearer <LOCALAI_API_KEY>`.
 
-The model named in `LOCALAI_MODEL` must be installed on the host (web UI, Models);
-the host then loads it on every PC.
+The model named in `LOCALAI_MODEL` must be installed on the host; the host then
+loads it on every PC. The default is `unsloth/gemma-4-12b-it-GGUF` from Hugging Face:
+in the web UI, Models, search for it and install the Q4_K_M variant, which LocalAI
+names `gemma-4-12b-it-Q4_K_M`. For another model or variant, put the name shown in
+the web UI into `LOCALAI_MODEL` (on the host and the workers) and restart.
 
 ## Worker
 

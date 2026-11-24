@@ -29,12 +29,30 @@ Both scripts run in the foreground and show the logs; Ctrl+C stops everything.
    ```powershell
    New-NetFirewallRule -DisplayName "LocalAI host" -Direction Inbound -Protocol TCP -LocalPort 23422,4222 -Action Allow -Profile Private,Domain
    ```
-   The Wi-Fi network must be set to **Private** in Windows settings.
+   The Wi-Fi network must be set to **Private** in Windows settings (Settings, Network &
+   internet, Wi-Fi, the network's properties): the rules above do not apply on a Public one.
+
+   If Windows once asked whether Docker may use the network and the answer was no (or the
+   dialog was closed), it added **block** rules for Docker, and a block rule wins over the
+   allow rule above. List them, and remove the ones whose Action is Block:
+   ```powershell
+   Get-NetFirewallRule | Where-Object { $_.DisplayName -like "*docker*" -and $_.Action -eq "Block" } | Format-Table DisplayName, Profile, Enabled
+   Get-NetFirewallRule | Where-Object { $_.DisplayName -like "*docker*" -and $_.Action -eq "Block" } | Remove-NetFirewallRule
+   ```
 
 **Linux**
 1. NVIDIA driver, Docker Engine with the compose plugin, NVIDIA Container Toolkit
    (`sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker`).
 2. If ufw is on, a worker needs: `sudo ufw allow from <host-ip> to any port 50050:50059 proto tcp`
+
+**Check that the host reaches each worker.** A worker connects out to the host, so it
+shows as healthy in the web UI even when the host cannot connect back to it, yet every
+model load and request the host sends to it then hangs. From the host, with the worker
+running (any HTTP answer means the port is open; a timeout means it is blocked):
+```
+curl -m 5 http://<worker-ip>:50050/
+curl -m 5 http://<worker-ip>:50051/
+```
 
 Check GPU access in Docker on either system:
 `docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi`
@@ -59,9 +77,11 @@ that insist on sending a key work, and so do clients and the web UI without one 
 UI opens as the admin "API Key User"; the add-on pages do not work under that user).
 The workers' own calls (`/api/node/*`) pass through unchanged, with their join token.
 
-**Models load on demand, and only `LOCALAI_MAX_LOADED_MODELS` at a time.** No model
-is loaded while the cluster is idle. The first request for a model loads one copy;
-more PCs get a copy only while all copies are busy. The proxy reads the model of every
+**Models load on demand, on every PC together, and only `LOCALAI_MAX_LOADED_MODELS`
+at a time.** No model is loaded while the cluster is idle. The first request for a
+model loads it, and within 5 seconds the proxy has every PC load it too (LocalAI
+scheduling `spread_all`), so all PCs serve it; when the proxy unloads it, it leaves
+every PC together. The proxy reads the model of every
 inference request and keeps at most `LOCALAI_MAX_LOADED_MODELS` different models (1 by
 default) loaded in the cluster: a request for another model first unloads the least
 recently used idle one. If all loaded models are busy, the request waits until one is
@@ -90,9 +110,14 @@ after the install) and its source in `.env`, and restart the host.
    ```
 
 This PC's IP and name are detected (override with `WORKER_IP` / `WORKER_NAME` in
-`.env`). The first run downloads the LocalAI image (~10 GB), then the CUDA backend
-(~3 GB) and the model from the host (~7 GB over Wi-Fi). They stay on the PC, so
-later runs are quick.
+`.env`). The first run downloads the LocalAI image (~10 GB) and the CUDA backend
+(~3 GB). They stay on the PC, so later runs are quick.
+
+Next to the worker runs a `sync` service: every 5 seconds it compares this PC's models
+with the host's and downloads what is missing from the host (about 12 GB the first
+time, over the network, resumed after an interruption). So a model is already on the
+PC when the host loads it here. Follow it with `docker logs -f localai-worker-sync`.
+The host's own GPU worker has the same service (`worker-sync`).
 
 ## Capacity
 

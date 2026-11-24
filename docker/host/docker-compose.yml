@@ -3,7 +3,9 @@
 #   proxy         :${LOCALAI_PORT} on the network (Node, proxy/server.mjs). Fills in the
 #                 API key, keeps at most LOCALAI_MAX_LOADED_MODELS models loaded and
 #                 unloads models after LOCALAI_IDLE_UNLOAD without requests. Installs
-#                 LOCALAI_MODEL and LOCALAI_EMBEDDING_MODEL at start when missing.
+#                 LOCALAI_MODEL and LOCALAI_EMBEDDING_MODEL at start when missing. A model
+#                 loaded on one PC is loaded on every PC, and unloaded from all together.
+#   worker-sync   copies the host's model files to worker-local (docker/worker/sync).
 #   frontend      API + web UI. Routes every request to a worker.
 #   worker-local  the GPU of this PC, registered as a worker like any other.
 #   postgres      users, API keys, node registry (required by distributed mode).
@@ -54,6 +56,8 @@ services:
       LOCALAI_MAX_LOADED_MODELS: "${LOCALAI_MAX_LOADED_MODELS:-1}"
       LOCALAI_IDLE_UNLOAD: "${LOCALAI_IDLE_UNLOAD:-2m}"
       LOCALAI_EVICT_WAIT: "${LOCALAI_EVICT_WAIT:-10m}"
+      # Workers' sync services fetch the model files with the join token.
+      LOCALAI_REGISTRATION_TOKEN: "${LOCALAI_REGISTRATION_TOKEN:?}"
       # Installed at start when missing (see proxy/server.mjs).
       LOCALAI_MODEL: "${LOCALAI_MODEL:-gemma-4-12B-it-qat-UD-Q4_K_XL}"
       LOCALAI_MODEL_URI: "${LOCALAI_MODEL_URI:-huggingface://unsloth/gemma-4-12B-it-qat-GGUF}"
@@ -62,6 +66,7 @@ services:
       LOCALAI_EMBEDDING_MODEL_URI: "${LOCALAI_EMBEDDING_MODEL_URI:-huggingface://Qwen/Qwen3-Embedding-8B-GGUF/Qwen3-Embedding-8B-Q4_K_M.gguf}"
     volumes:
       - ./proxy:/app:ro
+      - models:/models:ro
     ports:
       - "${LOCALAI_BIND:-0.0.0.0}:${LOCALAI_PORT:-23422}:8080"
     depends_on:
@@ -137,6 +142,22 @@ services:
               capabilities: [gpu, utility]
     depends_on:
       frontend:
+        condition: service_started
+
+  # Same sync as on the other PCs: worker-local gets the model files before it loads them.
+  worker-sync:
+    image: node:24-alpine
+    restart: unless-stopped
+    init: true
+    command: ["node", "/app/sync.mjs"]
+    environment:
+      HOST_URL: "http://proxy:8080"
+      LOCALAI_REGISTRATION_TOKEN: "${LOCALAI_REGISTRATION_TOKEN:?}"
+    volumes:
+      - ../worker/sync:/app:ro
+      - worker_models:/models
+    depends_on:
+      proxy:
         condition: service_started
 
 volumes:

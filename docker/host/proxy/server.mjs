@@ -9,6 +9,11 @@
 //          recently used idle one is unloaded. If all loaded models are busy, the request
 //          waits (up to LOCALAI_EVICT_WAIT) instead of failing out of memory.
 // Idle     A model with no running requests and no use for LOCALAI_IDLE_UNLOAD is unloaded.
+// Mirror   Every 5 s: a model loaded on any PC is switched to "a copy on every PC" (LocalAI
+//          scheduling spread_all), so all PCs load it together; when this proxy unloads it,
+//          it goes back to "load on demand" first, so it leaves every PC together.
+// Files    Workers' sync service (docker/worker/sync) downloads the host's model files from
+//          /_cluster/files (needs the join token), so a load on a worker finds them in place.
 // Install  At start, LOCALAI_MODEL and LOCALAI_EMBEDDING_MODEL are installed on the host when
 //          missing (from LOCALAI_MODEL_URI / LOCALAI_EMBEDDING_MODEL_URI). Workers get the
 //          files from the host the first time they load a model.
@@ -16,6 +21,9 @@
 // Plain Node (no packages). Settings come from the environment (see docker-compose.yml).
 import http from "node:http";
 import { EventEmitter } from "node:events";
+import { createReadStream } from "node:fs";
+import { stat } from "node:fs/promises";
+import { join, normalize } from "node:path";
 
 const UPSTREAM_HOST = process.env.UPSTREAM_HOST || "frontend";
 const UPSTREAM_PORT = Number(process.env.UPSTREAM_PORT || 8080);
@@ -26,6 +34,9 @@ const IDLE_MS = parseDuration(process.env.LOCALAI_IDLE_UNLOAD || "2m");
 const EVICT_WAIT_MS = parseDuration(process.env.LOCALAI_EVICT_WAIT || "10m");
 const KEY_CACHE_MS = 5 * 60_000;
 const MAX_JSON_BODY = 32 * 1024 * 1024;
+const MIRROR_MS = 5000;
+const MODELS_DIR = process.env.MODELS_DIR || "/models"; // the host's models, read-only
+const REGISTRATION_TOKEN = process.env.LOCALAI_REGISTRATION_TOKEN || "";
 const IDLE_CHECK_MS = 15_000;
 const INSTALL_RETRY_MS = 10 * 60_000;
 
@@ -170,6 +181,9 @@ async function loadedModels() {
 // Unload a model on every PC and wait until LocalAI no longer lists it, so its VRAM is free.
 async function unload(model, reason) {
   log(`unload ${model} (${reason})`);
+  // Back to "load on demand" first, or LocalAI would load it again on every PC.
+  await setScheduling(model, "demand");
+  unloadedAt.set(model, Date.now());
   const r = await api("POST", "/backend/shutdown", { model });
   if (r.status !== 200 && r.status !== 404) log(`unload ${model}: HTTP ${r.status} ${r.text.slice(0, 200)}`);
   for (let i = 0; i < 60; i++) {
@@ -245,12 +259,106 @@ async function unloadIdle() {
   });
 }
 
+// ---------------------------------------------------------------- mirror loads to every PC
+
+const scheduling = new Map(); // model -> "all" | "demand", as last set in LocalAI
+const unloadedAt = new Map(); // model -> when this proxy unloaded it
+let schedulingRead = false;
+
+async function setScheduling(model, mode) {
+  if (scheduling.get(model) === mode) return;
+  const body = mode === "all"
+    ? { model_name: model, spread_all: true }
+    : { model_name: model, min_replicas: 0, max_replicas: 64 };
+  const r = await api("POST", "/api/nodes/scheduling", body);
+  if (r.status !== 200) return log(`mirror: could not change ${model}: HTTP ${r.status} ${r.text.slice(0, 200)}`);
+  scheduling.set(model, mode);
+  log(`mirror: ${model} ${mode === "all" ? "loads on every PC" : "loads on demand again"}`);
+}
+
+// A model loaded anywhere runs on every PC. Right after this proxy unloaded a model, a copy
+// that was still loading somewhere is not spread again (the idle check removes it).
+async function mirror() {
+  await exclusive(async () => {
+    if (!schedulingRead) {
+      const r = await api("GET", "/api/nodes/scheduling");
+      for (const e of Array.isArray(r.json) ? r.json : []) scheduling.set(e.model_name, e.spread_all ? "all" : "demand");
+      schedulingRead = true;
+    }
+    const loaded = await loadedModels();
+    const names = new Set([...loaded.keys(), ...[...scheduling].filter(([, m]) => m === "all").map(([n]) => n)]);
+    for (const name of names) {
+      const justUnloaded = Date.now() - (unloadedAt.get(name) || 0) < 60_000 && !(usage.get(name)?.active > 0);
+      await setScheduling(name, loaded.has(name) && !justUnloaded ? "all" : "demand");
+    }
+  });
+}
+
+// ---------------------------------------------------------------- model files for workers
+
+// Every installed model's files (model file, mmproj), relative to MODELS_DIR. A worker keeps
+// them at /models/<model>/<path>, where LocalAI's own upload would put them.
+let manifestCache = { at: 0, value: null };
+async function manifest() {
+  if (manifestCache.value && Date.now() - manifestCache.at < 5000) return manifestCache.value;
+  const models = [];
+  for (const name of await installedModels()) {
+    const cfg = (await api("GET", `/api/models/config-json/${encodeURIComponent(name)}`)).json;
+    const files = [];
+    for (const p of [cfg?.parameters?.model, cfg?.mmproj]) {
+      if (typeof p !== "string" || !p) continue;
+      const rel = normalize(p).replace(/^\/+/, "");
+      if (rel.startsWith("..")) continue;
+      const st = await stat(join(MODELS_DIR, rel)).catch(() => null);
+      if (st?.isFile()) files.push({ path: rel, size: st.size });
+    }
+    if (files.length) models.push({ name, files });
+  }
+  manifestCache = { at: Date.now(), value: { models } };
+  return manifestCache.value;
+}
+
+// GET /_cluster/files              -> { models: [{ name, files: [{ path, size }] }] }
+// GET /_cluster/files?path=<path>  -> the file (Range supported, for resuming)
+async function serveFiles(req, res) {
+  if (!REGISTRATION_TOKEN || req.headers["x-registration-token"] !== REGISTRATION_TOKEN) {
+    return sendError(res, 401, "join token required (X-Registration-Token)");
+  }
+  const url = new URL(req.url, "http://proxy");
+  const m = await manifest();
+  const path = url.searchParams.get("path");
+  if (!path) {
+    const body = JSON.stringify(m);
+    res.writeHead(200, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) });
+    return res.end(body);
+  }
+  const file = m.models.flatMap((x) => x.files).find((f) => f.path === path);
+  if (!file) return sendError(res, 404, "not a model file");
+  const range = String(req.headers.range || "").match(/^bytes=(\d+)-$/);
+  const start = range ? Number(range[1]) : 0;
+  if (start > file.size) return sendError(res, 416, "range past the end");
+  res.writeHead(range ? 206 : 200, {
+    "Content-Type": "application/octet-stream",
+    "Content-Length": file.size - start,
+    ...(range && { "Content-Range": `bytes ${start}-${file.size - 1}/${file.size}` }),
+  });
+  createReadStream(join(MODELS_DIR, file.path), { start }).on("error", () => res.destroy()).pipe(res);
+}
+
 // ---------------------------------------------------------------- install missing models
 
 async function installedModels() {
   const r = await api("GET", "/v1/models");
   if (r.status !== 200) throw new Error(`GET /v1/models: HTTP ${r.status}`);
   return new Set((r.json?.data ?? []).map((m) => m.id));
+}
+
+let installedCache = { at: 0, value: new Set() };
+async function isInstalled(model) {
+  if (Date.now() - installedCache.at > 10_000 || !installedCache.value.has(model)) {
+    installedCache = { at: Date.now(), value: await installedModels() };
+  }
+  return installedCache.value.has(model);
 }
 
 // The import registers every GGUF as a chat model: switch embedding models over.
@@ -366,6 +474,7 @@ function forward(req, res, headers, body, done = () => {}) {
 
 async function handle(req, res) {
   const path = (req.url || "/").split("?")[0];
+  if (req.method === "GET" && path === "/_cluster/files") return serveFiles(req, res);
   let headers;
   try {
     headers = await upstreamHeaders(req, path);
@@ -384,6 +493,8 @@ async function handle(req, res) {
   let model = null;
   try { model = JSON.parse(body.toString("utf8"))?.model; } catch {}
   if (typeof model !== "string" || !model) return forward(req, res, headers, body);
+  // A model that is not installed loads nothing: LocalAI answers it (404) without waiting.
+  if (!(await isInstalled(model).catch(() => true))) return forward(req, res, headers, body);
 
   let gone = false;
   res.on("close", () => { gone = true; });
@@ -440,4 +551,5 @@ server.listen(LISTEN_PORT, () => {
 });
 setInterval(() => unloadIdle().catch((e) => log(`idle check: ${e.message}`)), IDLE_CHECK_MS);
 ensureModels();
+setInterval(() => mirror().catch((e) => log(`mirror: ${e.message}`)), MIRROR_MS);
 for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => process.exit(0));
